@@ -26,6 +26,8 @@ The dependency is `valkey-cuckoo`, imported as `cuckoofilter` and patched to a f
 
 ## Comparison with RedisBloom
 
+See [the measured comparison and reproduction environment](../benchmarks/README.md).
+
 Run `python benchmarks/cuckoo_comparison.py --help` for the benchmark driver. Use two dedicated, idle servers. It creates and removes only `cuckoo-bench:*` keys.
 
 The driver varies item count (10k, 100k, 1M), bucket size, maximum iterations, and expansion. Each pair receives identical `item:<integer>` values and parameters. Scaling configurations start at one quarter of the requested item count; expansion 0 starts at the requested count. It records `MEMORY USAGE`, insertion errors, membership hits, pipeline throughput, and sampled single-command ADD/EXISTS latency across the loading range. It alternates implementation order between repeats.
