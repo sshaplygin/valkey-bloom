@@ -75,7 +75,7 @@ class TestCuckooReplication(ReplicationTestCase):
         assert self.replicas[0].client.execute_command('CF.EXISTS', 'insRepl', 'val3') == 1
 
     def test_occurrence_count_replication(self):
-        """Test that duplicate counts replicate correctly"""
+        """Test that membership estimates replicate correctly"""
         self.setup_replication(num_replicas=1)
 
         self.client.execute_command('CF.ADD', 'countRepl', 'item1')
@@ -84,7 +84,7 @@ class TestCuckooReplication(ReplicationTestCase):
         self.waitForReplicaToSyncUp(self.replicas[0])
 
         count = self.replicas[0].client.execute_command('CF.COUNT', 'countRepl', 'item1')
-        assert count == 3
+        assert count == 1
 
     def test_scaling_filter_replication(self):
         """Test that filter scaling replicates correctly"""
@@ -173,3 +173,49 @@ class TestCuckooReplication(ReplicationTestCase):
 
         exists = self.replicas[0].client.execute_command('CF.EXISTS', 'reconnTest', 'item2')
         assert exists == 1
+
+    @pytest.mark.parametrize('command', ['CF.ADD', 'CF.ADDNX', 'CF.INSERT', 'CF.INSERTNX', 'CF.RESERVE'])
+    def test_creation_replicates_all_properties(self, command):
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        for suffix, primary, secondary in [
+            ('capacity', 32, 128), ('bucket-size', 2, 8),
+            ('max-kicks', 20, 100), ('expansion', 2, 4),
+        ]:
+            self.client.config_set('bf.cuckoo-' + suffix, primary)
+            replica.config_set('bf.cuckoo-' + suffix, secondary)
+        if command == 'CF.RESERVE':
+            self.client.execute_command(command, 'properties', 32)
+        elif command in ('CF.INSERT', 'CF.INSERTNX'):
+            self.client.execute_command(command, 'properties', 'ITEMS', 'first')
+        else:
+            self.client.execute_command(command, 'properties', 'first')
+        for i in range(150):
+            self.client.execute_command('CF.ADD', 'properties', f'value-{i}')
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.client.dump('properties') == replica.dump('properties')
+        assert self.client.execute_command('DEBUG', 'DIGEST-VALUE', 'properties') == replica.execute_command('DEBUG', 'DIGEST-VALUE', 'properties')
+
+    def test_partial_insert_replication_with_different_memory_limits(self):
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        self.client.execute_command('CF.RESERVE', 'limited', 4, 'EXPANSION', 1)
+        info = self.client.execute_command('CF.INFO', 'limited')
+        size = dict(zip(info[::2], info[1::2]))[b'Size']
+        self.client.config_set('bf.cuckoo-memory-usage-limit', size)
+        response = self.client.execute_command('CF.INSERT', 'limited', 'ITEMS', *[f'value-{i}' for i in range(20)])
+        assert any(isinstance(value, ResponseError) for value in response)
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.client.dump('limited') == replica.dump('limited')
+
+    def test_full_sync_preserves_rng_for_future_insertions(self):
+        self.client.execute_command('CF.RESERVE', 'snapshot', 128, 'BUCKETSIZE', 2, 'EXPANSION', 2)
+        for i in range(400):
+            self.client.execute_command('CF.ADD', 'snapshot', f'value-{i}')
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        assert self.client.dump('snapshot') == replica.dump('snapshot')
+        for i in range(400, 1200):
+            self.client.execute_command('CF.ADD', 'snapshot', f'value-{i}')
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.client.dump('snapshot') == replica.dump('snapshot')

@@ -177,6 +177,11 @@ pub unsafe extern "C" fn cuckoo_defrag(
     // into_boxed_slice() shrinks capacity to len, so we use filters_len for both len and capacity.
     let filters_vec = mem::take(cuckoo_object.filters_mut());
     let filters_len = filters_vec.len();
+    metrics::CUCKOO_OBJECT_TOTAL_MEMORY_BYTES.fetch_sub(
+        (filters_vec.capacity() - filters_len)
+            * mem::size_of::<Box<crate::cuckoo::utils::CuckooFilter>>(),
+        Ordering::Relaxed,
+    );
     let filters_ptr = Box::into_raw(filters_vec.into_boxed_slice()) as *mut c_void;
     let defragged_filters_ptr = defrag.alloc(filters_ptr);
 

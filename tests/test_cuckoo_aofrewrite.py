@@ -139,10 +139,10 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
             assert exists == 1
 
     def test_aof_rewrite_occurrence_counts(self):
-        """Test that occurrence counts are preserved in AOF rewrite"""
+        """Test that membership estimates are preserved in AOF rewrite"""
         client = self.server.get_new_client()
 
-        # Add items with different occurrence counts
+        # Add items with different membership estimates
         for i in range(5):
             client.execute_command('CF.ADD', 'countAOF', 'item1')
         for i in range(3):
@@ -168,8 +168,8 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         count2_after = client.execute_command('CF.COUNT', 'countAOF', 'item2')
         count3_after = client.execute_command('CF.COUNT', 'countAOF', 'item3')
 
-        assert count1_after == count1_before == 5
-        assert count2_after == count2_before == 3
+        assert count1_after == count1_before == 1
+        assert count2_after == count2_before == 1
         assert count3_after == count3_before == 1
 
     def test_aof_with_reserve_options(self):

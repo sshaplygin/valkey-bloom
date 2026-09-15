@@ -63,7 +63,7 @@ lazy_static! {
 /// Cuckoo Filter Configurations
 pub const CUCKOO_CAPACITY_DEFAULT: i64 = 1000;
 pub const CUCKOO_CAPACITY_MIN: i64 = 1;
-pub const CUCKOO_CAPACITY_MAX: i64 = i64::MAX;
+pub const CUCKOO_CAPACITY_MAX: i64 = 1 << 32;
 
 pub const CUCKOO_BUCKET_SIZE_DEFAULT: i64 = 4;
 pub const CUCKOO_BUCKET_SIZE_MIN: i64 = 1;
@@ -74,8 +74,8 @@ pub const CUCKOO_MAX_KICKS_MIN: i64 = 1;
 pub const CUCKOO_MAX_KICKS_MAX: i64 = 65535;
 
 pub const CUCKOO_EXPANSION_DEFAULT: i64 = 1;
-pub const CUCKOO_EXPANSION_MIN: u32 = 1;
-pub const CUCKOO_EXPANSION_MAX: u32 = u32::MAX;
+pub const CUCKOO_EXPANSION_MIN: u32 = 0;
+pub const CUCKOO_EXPANSION_MAX: u32 = 32768;
 
 pub const CUCKOO_MEMORY_LIMIT_PER_OBJECT_DEFAULT: i64 = 128 * 1024 * 1024;
 pub const CUCKOO_MEMORY_LIMIT_PER_OBJECT_MIN: i64 = 0;

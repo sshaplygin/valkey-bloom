@@ -24,7 +24,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         cf_exists_result_1 = client.execute_command('CF.EXISTS', 'testSave', 'item1')
         assert cf_exists_result_1 == 1
         cf_count_result_1 = client.execute_command('CF.COUNT', 'testSave', 'item1')
-        assert cf_count_result_1 == 2  # Added twice
+        assert cf_count_result_1 == 1  # Repeated insertion retains one fingerprint
         cf_info_result_1 = client.execute_command('CF.INFO', 'testSave')
         assert len(cf_info_result_1) != 0
 
@@ -60,7 +60,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         assert cf_exists_result_2 == 1
 
         cf_count_result_2 = client.execute_command('CF.COUNT', 'testSave', 'item1')
-        assert cf_count_result_2 == 2  # Count preserved
+        assert cf_count_result_2 == 1  # Membership estimate preserved
 
         cf_info_result_2 = client.execute_command('CF.INFO', 'testSave')
         assert cf_info_result_2 == cf_info_result_1
@@ -95,7 +95,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
             exists = client.execute_command('CF.EXISTS', name, f'value{i}')
             assert exists == 1
             count_val = client.execute_command('CF.COUNT', name, f'value{i}')
-            assert count_val == 2
+            assert count_val == 1
 
     def test_save_with_deletions(self):
         """Test that deletions are preserved across save/restore"""
@@ -166,12 +166,12 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
             assert exists == 1
 
     def test_save_with_occurrence_counts(self):
-        """Test that occurrence counts (duplicates) are preserved"""
+        """Test that membership estimates (duplicates) are preserved"""
         client = self.server.get_new_client()
 
         client.execute_command('CF.RESERVE', 'countTest', 1000)
 
-        # Add items with different occurrence counts
+        # Add items with different membership estimates
         for i in range(5):  # item0 added 5 times
             client.execute_command('CF.ADD', 'countTest', 'item0')
         for i in range(3):  # item1 added 3 times
@@ -182,8 +182,8 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         count0_before = client.execute_command('CF.COUNT', 'countTest', 'item0')
         count1_before = client.execute_command('CF.COUNT', 'countTest', 'item1')
         count2_before = client.execute_command('CF.COUNT', 'countTest', 'item2')
-        assert count0_before == 5
-        assert count1_before == 3
+        assert count0_before == 1
+        assert count1_before == 1
         assert count2_before == 1
 
         # Save and restart
@@ -198,6 +198,6 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         count0_after = client.execute_command('CF.COUNT', 'countTest', 'item0')
         count1_after = client.execute_command('CF.COUNT', 'countTest', 'item1')
         count2_after = client.execute_command('CF.COUNT', 'countTest', 'item2')
-        assert count0_after == 5
-        assert count1_after == 3
+        assert count0_after == 1
+        assert count1_after == 1
         assert count2_after == 1

@@ -120,10 +120,10 @@ class TestCuckooDefrag(ValkeyBloomTestCaseBase):
             assert exists == 1
 
     def test_defrag_preserves_counts(self):
-        """Test that defrag preserves occurrence counts"""
+        """Test that defrag preserves membership estimates"""
         client = self.server.get_new_client()
 
-        # Create filter with duplicate counts
+        # Create filter with membership estimates
         client.execute_command('CF.RESERVE', 'countDefrag', 1000)
         for i in range(5):
             client.execute_command('CF.ADD', 'countDefrag', 'item1')
@@ -141,8 +141,8 @@ class TestCuckooDefrag(ValkeyBloomTestCaseBase):
         count1_after = client.execute_command('CF.COUNT', 'countDefrag', 'item1')
         count2_after = client.execute_command('CF.COUNT', 'countDefrag', 'item2')
 
-        assert count1_after == count1_before == 5
-        assert count2_after == count2_before == 3
+        assert count1_after == count1_before == 1
+        assert count2_after == count2_before == 1
 
     def test_defrag_filter_info_unchanged(self):
         """Test that CF.INFO results are unchanged after defrag"""

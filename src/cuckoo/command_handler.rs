@@ -18,8 +18,7 @@ fn validate_capacity(capacity: i64) -> Result<(), ValkeyError> {
     if capacity == 0 {
         return Err(ValkeyError::Str(CAPACITY_MUST_BE_LARGER_THAN_ZERO));
     }
-    // CUCKOO_CAPACITY_MAX == i64::MAX, so only the lower bound matters
-    if capacity < configs::CUCKOO_CAPACITY_MIN {
+    if !(configs::CUCKOO_CAPACITY_MIN..=configs::CUCKOO_CAPACITY_MAX).contains(&capacity) {
         return Err(ValkeyError::Str(CAPACITY_OUT_OF_RANGE));
     }
     Ok(())
@@ -37,6 +36,53 @@ fn validate_max_kicks(max_kicks: i64) -> Result<(), ValkeyError> {
         return Err(ValkeyError::Str(MAX_KICKS_OUT_OF_RANGE));
     }
     Ok(())
+}
+
+// Creation always carries every property, even if the first insertion fails.
+fn replicate_creation(
+    ctx: &Context,
+    key: &ValkeyString,
+    capacity: i64,
+    bucket_size: usize,
+    max_kicks: u32,
+    expansion: u32,
+) {
+    let values: Vec<ValkeyString> = [
+        capacity.to_string(),
+        "BUCKETSIZE".into(),
+        bucket_size.to_string(),
+        "MAXITERATIONS".into(),
+        max_kicks.to_string(),
+        "EXPANSION".into(),
+        expansion.to_string(),
+    ]
+    .iter()
+    .map(|s| ValkeyString::create_from_slice(std::ptr::null_mut(), s.as_bytes()))
+    .collect();
+    let mut command = vec![key];
+    command.extend(values.iter());
+    ctx.replicate("CF.RESERVE", command.as_slice());
+}
+
+// Replay only the successfully processed prefix. Replaying the entire command
+// could insert extra items on a replica with a different local memory limit.
+fn replicate_items(ctx: &Context, args: &[ValkeyString], item_idx: usize, response: &ValkeyResult) {
+    let count = match response {
+        Ok(ValkeyValue::Array(values)) => values
+            .iter()
+            .take_while(|v| matches!(v, ValkeyValue::Integer(_)))
+            .count(),
+        Ok(ValkeyValue::Integer(_)) => 1,
+        _ => 0,
+    };
+    if count == 0 {
+        return;
+    }
+    let nocreate = ValkeyString::create_from_slice(std::ptr::null_mut(), b"NOCREATE");
+    let items = ValkeyString::create_from_slice(std::ptr::null_mut(), b"ITEMS");
+    let mut command = vec![&args[1], &nocreate, &items];
+    command.extend(args[item_idx..item_idx + count].iter());
+    ctx.replicate("CF.INSERT", command.as_slice());
 }
 
 struct InsertOptions {
@@ -203,7 +249,7 @@ pub fn cuckoo_filter_add_value(
                 validate_size_limit,
             );
             if add_succeeded {
-                ctx.replicate_verbatim();
+                replicate_items(ctx, &args, curr_cmd_idx, &response);
                 ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
             }
             response
@@ -237,9 +283,10 @@ pub fn cuckoo_filter_add_value(
 
             match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
                 Ok(()) => {
+                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
+                    replicate_items(ctx, &args, curr_cmd_idx, &response);
+                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                     if add_succeeded {
-                        ctx.replicate_verbatim();
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                         ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
                     }
                     response
@@ -333,7 +380,7 @@ pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>, multi: bool) 
                 validate_size_limit,
             );
             if add_succeeded {
-                ctx.replicate_verbatim();
+                replicate_items(ctx, &args, curr_cmd_idx, &response);
                 ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
             }
             response
@@ -367,9 +414,10 @@ pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>, multi: bool) 
 
             match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
                 Ok(()) => {
+                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
+                    replicate_items(ctx, &args, curr_cmd_idx, &response);
+                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                     if add_succeeded {
-                        ctx.replicate_verbatim();
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                         ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
                     }
                     response
@@ -524,7 +572,7 @@ pub fn cuckoo_filter_insert(ctx: &Context, args: Vec<ValkeyString>, nx_mode: boo
             };
 
             if add_succeeded {
-                ctx.replicate_verbatim();
+                replicate_items(ctx, &args, items_idx, &response);
                 ctx.notify_keyspace_event(NotifyEvent::MODULE, INSERT_EVENT, key_name);
             }
             response
@@ -581,9 +629,10 @@ pub fn cuckoo_filter_insert(ctx: &Context, args: Vec<ValkeyString>, nx_mode: boo
 
             match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
                 Ok(()) => {
+                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
+                    replicate_items(ctx, &args, items_idx, &response);
+                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                     if add_succeeded {
-                        ctx.replicate_verbatim();
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
                         ctx.notify_keyspace_event(NotifyEvent::MODULE, INSERT_EVENT, key_name);
                     }
                     response
@@ -652,7 +701,13 @@ pub fn cuckoo_filter_reserve(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyRe
                     return Err(ValkeyError::Str(EXPANSION_ARG_REQUIRED));
                 }
                 expansion = match args[curr_cmd_idx].to_string_lossy().parse::<i64>() {
-                    Ok(num) if num >= configs::CUCKOO_EXPANSION_MIN as i64 => num,
+                    Ok(num)
+                        if (configs::CUCKOO_EXPANSION_MIN as i64
+                            ..=configs::CUCKOO_EXPANSION_MAX as i64)
+                            .contains(&num) =>
+                    {
+                        num
+                    }
                     _ => return Err(ValkeyError::Str(BAD_EXPANSION)),
                 };
             }
@@ -685,7 +740,14 @@ pub fn cuckoo_filter_reserve(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyRe
 
             match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
                 Ok(()) => {
-                    ctx.replicate_verbatim();
+                    replicate_creation(
+                        ctx,
+                        key_name,
+                        capacity,
+                        bucket_size as usize,
+                        max_kicks as u32,
+                        expansion as u32,
+                    );
                     ctx.notify_keyspace_event(NotifyEvent::MODULE, RESERVE_EVENT, key_name);
                     VALKEY_OK
                 }
@@ -729,7 +791,13 @@ pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
                 ValkeyValue::SimpleStringStatic("Size"),
                 ValkeyValue::Integer(cuckoo.memory_usage() as i64),
                 ValkeyValue::SimpleStringStatic("Number of buckets"),
-                ValkeyValue::Integer(cuckoo.num_filters() as i64),
+                ValkeyValue::Integer(
+                    cuckoo
+                        .filters()
+                        .iter()
+                        .map(|f| f.bucket_count() as i64)
+                        .sum(),
+                ),
                 ValkeyValue::SimpleStringStatic("Number of items inserted"),
                 ValkeyValue::Integer(cuckoo.num_items()),
                 ValkeyValue::SimpleStringStatic("Number of filters"),
@@ -757,7 +825,7 @@ pub fn cuckoo_filter_load(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
     let key_name = &args[1];
     let data = args[2].as_slice();
 
-    let cuckoo = match CuckooObject::decode_object(data, true) {
+    let cuckoo = match CuckooObject::decode_object(data, !must_obey_client(ctx)) {
         Ok(cf) => cf,
         Err(err) => return Err(ValkeyError::Str(err.as_str())),
     };

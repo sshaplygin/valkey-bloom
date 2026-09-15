@@ -239,3 +239,28 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         # Info should show items were added
         # Note: Exact format depends on implementation
         assert info is not None
+
+    def test_duplicate_after_scaling_needs_only_one_delete(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'dedup', 8, 'EXPANSION', 2)
+        client.execute_command('CF.ADD', 'dedup', 'original')
+        for i in range(40):
+            client.execute_command('CF.ADD', 'dedup', f'later-{i}')
+        before = client.dump('dedup')
+        client.execute_command('CF.ADD', 'dedup', 'original')
+        assert client.dump('dedup') == before
+        assert client.execute_command('CF.COUNT', 'dedup', 'original') == 1
+        assert client.execute_command('CF.DEL', 'dedup', 'original') == 1
+        assert client.execute_command('CF.EXISTS', 'dedup', 'original') == 0
+
+    def test_copy_preserves_raw_state_and_rng(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'source', 64, 'BUCKETSIZE', 2)
+        for i in range(100):
+            client.execute_command('CF.ADD', 'source', f'value-{i}')
+        assert client.copy('source', 'copy')
+        assert client.dump('source') == client.dump('copy')
+        for i in range(100, 300):
+            client.execute_command('CF.ADD', 'source', f'value-{i}')
+            client.execute_command('CF.ADD', 'copy', f'value-{i}')
+        assert client.dump('source') == client.dump('copy')
