@@ -16,7 +16,7 @@ This implementation stores one-byte fingerprints, not item strings or an occurre
 
 ## Replication and persistence
 
-All filters use fixed-key SipHash-1-3 with canonical little-endian length encoding, and ChaCha8 seeded with 42. Creation is replicated as `CF.RESERVE` with every property explicitly specified. Multi-item commands replicate only the processed successful prefix using `CF.INSERT ... NOCREATE ITEMS ...`; replica configuration differences cannot cause extra insertions after a primary-side memory-limit failure.
+RNG and hasher dependency versions are pinned to keep their behavior consistent across builds. All filters use fixed-key SipHash-1-3 with canonical little-endian length encoding, and ChaCha8 seeded with 42. Creation is replicated as `CF.RESERVE` with every property explicitly specified. Multi-item commands replicate only the processed successful prefix using `CF.INSERT ... NOCREATE ITEMS ...`; replica configuration differences cannot cause extra insertions after a primary-side memory-limit failure.
 
 Failed insertions restore the exact fingerprint data and RNG state. They never drop an existing fingerprint. Copies, RDB snapshots, AOF rewrites, and full replica synchronization preserve raw fingerprint data, filter metadata, and the ChaCha stream position. The digest includes these values so it can detect equal-sized filters with different contents or RNG positions.
 
