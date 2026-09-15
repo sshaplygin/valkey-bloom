@@ -56,6 +56,7 @@ pub enum BloomError {
     DecodeBloomFilterFailed,
     DecodeUnsupportedVersion,
     ErrorRateRange,
+    TighteningRatioRange,
     BadExpansion,
     FalsePositiveReachesZero,
     BadCapacity,
@@ -73,6 +74,7 @@ impl BloomError {
             BloomError::DecodeBloomFilterFailed => DECODE_BLOOM_OBJECT_FAILED,
             BloomError::DecodeUnsupportedVersion => DECODE_UNSUPPORTED_VERSION,
             BloomError::ErrorRateRange => ERROR_RATE_RANGE,
+            BloomError::TighteningRatioRange => TIGHTENING_RATIO_RANGE,
             BloomError::BadExpansion => BAD_EXPANSION,
             BloomError::FalsePositiveReachesZero => FALSE_POSITIVE_DEGRADES_TO_O,
             BloomError::BadCapacity => BAD_CAPACITY,
@@ -303,13 +305,54 @@ impl BloomObject {
         &mut self.filters
     }
 
+    /// Check whether the bloom object can accommodate `count` new item additions without hitting
+    /// errors that would also fire on replicas and cause them to crash (e.g., NonScalingFilterFull,
+    /// exceeding memory limits, false positive degradation, or capacity overflow).
+    ///
+    /// This reuses `calculate_max_scaled_capacity` to simulate scale-out with memory usage checks.
+    pub fn validate_add_items(&self, count: i64) -> Result<(), BloomError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let remaining = self.capacity() - self.cardinality();
+        if remaining >= count {
+            return Ok(());
+        }
+        if self.expansion == 0 {
+            return Err(BloomError::NonScalingFilterFull);
+        }
+        let needed_total = self.cardinality() + count;
+        Self::calculate_max_scaled_capacity(
+            self.starting_capacity(),
+            self.fp_rate,
+            needed_total,
+            self.tightening_ratio,
+            self.expansion,
+        )
+        .map_err(|e| match e {
+            BloomError::ValidateScaleToExceedsMaxSize => BloomError::ExceedsMaxBloomSize,
+            BloomError::ValidateScaleToFalsePositiveInvalid => BloomError::FalsePositiveReachesZero,
+            other => other,
+        })?;
+        Ok(())
+    }
+
     /// Add an item to the BloomObject structure.
     /// If scaling is enabled, this can result in a new sub filter creation.
     pub fn add_item(&mut self, item: &[u8], validate_size_limit: bool) -> Result<i64, BloomError> {
-        // Check if item exists already.
         if self.item_exists(item) {
             return Ok(0);
         }
+        self.add_item_unchecked(item, validate_size_limit)
+    }
+
+    /// Add an item without checking if it already exists. The caller must ensure the item is new.
+    /// If scaling is enabled, this can result in a new sub filter creation.
+    pub fn add_item_unchecked(
+        &mut self,
+        item: &[u8],
+        validate_size_limit: bool,
+    ) -> Result<i64, BloomError> {
         let num_filters = self.filters.len() as i32;
         if let Some(filter) = self.filters.last_mut() {
             if filter.num_items < filter.capacity {
@@ -403,6 +446,14 @@ impl BloomObject {
         );
     }
 
+    pub fn decrement_metrics_on_defrag(&self, predefrag_filters_capacity: usize) {
+        metrics::BLOOM_OBJECT_TOTAL_MEMORY_BYTES.fetch_sub(
+            (predefrag_filters_capacity - self.num_filters())
+                * std::mem::size_of::<Box<BloomFilter>>(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Deserialize a byte array to bloom filter.
     /// We will need to handle any current or previous version and deserializing the bytes into a bloom object of the running Module's current version `BLOOM_OBJECT_VERSION`.
     pub fn decode_object(
@@ -427,13 +478,18 @@ impl BloomObject {
                     &decoded_bytes[1..],
                 ) {
                     Ok(values) => {
-                        // Add individual bloom filter metrics.
+                        // Validate num_filters to prevent crashes from corrupt data
+                        if values.4.is_empty() {
+                            return Err(BloomError::DecodeBloomFilterFailed);
+                        }
+                        // Validate capacity and num_items to prevent crashes
                         for filter in &values.4 {
-                            metrics::BLOOM_NUM_ITEMS_ACROSS_OBJECTS.fetch_add(
-                                filter.num_items as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            filter.bloom_filter_incr_metrics_on_new_create();
+                            if filter.capacity <= 0 {
+                                return Err(BloomError::BadCapacity);
+                            }
+                            if filter.num_items > filter.capacity {
+                                return Err(BloomError::DecodeBloomFilterFailed);
+                            }
                         }
                         // Expansion ratio can range from 0 to BLOOM_EXPANSION_MAX as we internally set this to 0
                         // in case of non scaling filters.
@@ -446,12 +502,20 @@ impl BloomObject {
                         if !(values.2 > BLOOM_TIGHTENING_RATIO_MIN
                             && values.2 < BLOOM_TIGHTENING_RATIO_MAX)
                         {
-                            return Err(BloomError::ErrorRateRange);
+                            return Err(BloomError::TighteningRatioRange);
                         }
                         if values.4.len()
                             >= configs::BLOOM_NUM_FILTERS_PER_OBJECT_LIMIT_MAX as usize
                         {
                             return Err(BloomError::MaxNumScalingFilters);
+                        }
+                        // Add individual bloom filter metrics.
+                        for filter in &values.4 {
+                            metrics::BLOOM_NUM_ITEMS_ACROSS_OBJECTS.fetch_add(
+                                filter.num_items as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            filter.bloom_filter_incr_metrics_on_new_create();
                         }
                         values
                     }
@@ -1228,6 +1292,7 @@ mod tests {
         let key = "key";
         let _ = bf.add_item(key.as_bytes(), true);
         let origin_fp_rate = bf.fp_rate;
+        let origin_tightening_ratio = bf.tightening_ratio;
 
         // unsupport fp_rate
         bf.fp_rate = -0.5;
@@ -1238,6 +1303,22 @@ mod tests {
             Some(BloomError::ErrorRateRange)
         );
         bf.fp_rate = origin_fp_rate;
+
+        // out-of-range tightening_ratio (must surface as TighteningRatioRange,
+        // not ErrorRateRange).
+        bf.tightening_ratio = -0.5;
+        let vec = bf.encode_object().unwrap();
+        assert_eq!(
+            BloomObject::decode_object(&vec, true).err(),
+            Some(BloomError::TighteningRatioRange)
+        );
+        bf.tightening_ratio = 1.5;
+        let vec = bf.encode_object().unwrap();
+        assert_eq!(
+            BloomObject::decode_object(&vec, true).err(),
+            Some(BloomError::TighteningRatioRange)
+        );
+        bf.tightening_ratio = origin_tightening_ratio;
 
         // build a larger than 64mb filter
         let extra_large_filter =

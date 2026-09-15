@@ -182,6 +182,117 @@ class TestBloomReplication(ReplicationTestCase):
             assert primary_cmd_stats["failed_calls"] == 1
             assert ('cmdstat_' + prefix) not in self.replicas[0].client.info("Commandstats")
 
+    def _find_new_items(self, key, count, start_offset=1000):
+        """Find items that don't false-positive on the given bloom filter."""
+        items = []
+        for i in range(count):
+            item = f"newitem_{start_offset + i}"
+            while self.client.execute_command(f"BF.EXISTS {key} {item}") == 1:
+                item = item + "x"
+            items.append(item)
+        return items
+
+    def test_madd_nonscaling_filter_full_replication(self):
+        """
+        Verify that BF.MADD on a nearly-full nonscaling filter rejects the
+        entire command when any item would overflow, rather than partially
+        succeeding and replicating a command that crashes the replica.
+
+        The command must fail atomically on the primary — no items added,
+        no replication, replica stays healthy.
+        """
+        use_external = os.environ.get("VALKEY_EXTERNAL_SERVER", "false").lower() == "true"
+        if use_external:
+            self.wait_for_primary_link_up_all_replicas()
+        else:
+            self.setup_replication(num_replicas=1)
+
+        capacity = 10
+        key = "bf_nonscaling"
+
+        self.replicas[0].client.execute_command(
+            "CONFIG SET propagation-error-behavior panic"
+        )
+
+        # Create nonscaling filter and fill to capacity - 1.
+        self.client.execute_command(f"BF.RESERVE {key} 0.01 {capacity} NONSCALING")
+        self.waitForReplicaToSyncUp(self.replicas[0])
+
+        idx = 0
+        added = 0
+        while added < capacity - 1:
+            if self.client.execute_command(f"BF.ADD {key} fillitem{idx}") == 1:
+                added += 1
+            idx += 1
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+
+        last_item, overflow_item = self._find_new_items(key, 2, start_offset=idx + 1000)
+
+        # BF.MADD with two new items but only 1 slot left.
+        # The entire command must be rejected — no partial success.
+        try:
+            self.client.execute_command(f"BF.MADD {key} {last_item} {overflow_item}")
+            assert False, "BF.MADD should have failed entirely"
+        except ResponseError as e:
+            assert "non scaling filter is full" in str(e)
+
+        # No items should have been added on the primary.
+        assert self.client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+        assert self.client.execute_command(f"BF.EXISTS {key} {last_item}") == 0
+
+        # Replica must be alive and consistent.
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.replicas[0].client.ping()
+        assert self.replicas[0].client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+
+    def test_insert_nonscaling_filter_full_replication(self):
+        """
+        Same scenario as test_madd_nonscaling_filter_full_replication but
+        triggered via BF.INSERT. The entire command must be rejected
+        atomically when any item would overflow a nonscaling filter.
+        """
+        use_external = os.environ.get("VALKEY_EXTERNAL_SERVER", "false").lower() == "true"
+        if use_external:
+            self.wait_for_primary_link_up_all_replicas()
+        else:
+            self.setup_replication(num_replicas=1)
+
+        capacity = 10
+        key = "bf_insert_nonscaling"
+
+        self.replicas[0].client.execute_command(
+            "CONFIG SET propagation-error-behavior panic"
+        )
+
+        self.client.execute_command(f"BF.RESERVE {key} 0.01 {capacity} NONSCALING")
+        self.waitForReplicaToSyncUp(self.replicas[0])
+
+        idx = 0
+        added = 0
+        while added < capacity - 1:
+            if self.client.execute_command(f"BF.ADD {key} fitem{idx}") == 1:
+                added += 1
+            idx += 1
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+
+        last_item, overflow_item = self._find_new_items(key, 2, start_offset=idx + 1000)
+
+        try:
+            self.client.execute_command(
+                f"BF.INSERT {key} NOCREATE ITEMS {last_item} {overflow_item}"
+            )
+            assert False, "BF.INSERT should have failed entirely"
+        except ResponseError as e:
+            assert "non scaling filter is full" in str(e)
+
+        assert self.client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.replicas[0].client.ping()
+        assert self.replicas[0].client.execute_command(f"BF.INFO {key} ITEMS") == capacity - 1
+
     def test_deterministic_replication(self):
         use_external = os.environ.get("VALKEY_EXTERNAL_SERVER", "false").lower() == "true"
         if use_external:
@@ -219,3 +330,65 @@ class TestBloomReplication(ReplicationTestCase):
             assert self.replicas[0].client.execute_command('CONFIG GET bf.bloom-expansion')[1] == b'2'
             assert self.replicas[0].client.execute_command('CONFIG GET bf.bloom-fp-rate')[1] == b'0.01'
             assert self.replicas[0].client.execute_command('CONFIG GET bf.bloom-tightening-ratio')[1] == b'0.5'
+
+    def test_validatescaleto_skipped_on_replica(self):
+        # When `BF.INSERT ... VALIDATESCALETO ...` adds items to an existing
+        # bloom, the original command is replicated verbatim. If the replica
+        # has a smaller bloom-memory-usage-limit than the primary, re-running
+        # the VALIDATESCALETO projection on the replica with its own limit can
+        # reject a write that succeeded on the primary, silently diverging
+        # primary/replica state.
+        #
+        # Must-obey clients (replication, AOF replay, slot-migration import)
+        # must therefore skip the VALIDATESCALETO projection — the source
+        # already validated against its own configured limit.
+        use_external = os.environ.get("VALKEY_EXTERNAL_SERVER", "false").lower() == "true"
+        if use_external:
+            self.wait_for_primary_link_up_all_replicas()
+        else:
+            self.setup_replication(num_replicas=1)
+
+        # Tighten the replica's per-object memory limit so a VALIDATESCALETO
+        # projection that passes on the primary (default 128MB) would be
+        # rejected here if it ran.
+        assert self.replicas[0].client.execute_command(
+            'CONFIG SET bf.bloom-memory-usage-limit 1024') == b'OK'
+
+        # Step 1: create the bloom. Reserve replicates as a deterministic
+        # BF.INSERT *without* VALIDATESCALETO, so this step always succeeds.
+        assert self.client.execute_command(
+            'BF.INSERT key CAPACITY 100 ERROR 0.01 EXPANSION 2 '
+            'VALIDATESCALETO 1000000 ITEMS a') == [1]
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert self.replicas[0].client.execute_command('BF.EXISTS key a') == 1
+
+        # Step 2: add to the existing bloom. This is the divergence-prone path:
+        # `add_operation` triggers replicate_verbatim(), so the replica
+        # receives the original command including VALIDATESCALETO and re-runs
+        # the projection against its 64KB limit.
+        assert self.client.execute_command(
+            'BF.INSERT key CAPACITY 100 ERROR 0.01 EXPANSION 2 '
+            'VALIDATESCALETO 1000000 ITEMS b') == [1]
+        self.waitForReplicaToSyncUp(self.replicas[0])
+
+        # Replica must have applied the add, not silently dropped it.
+        assert self.replicas[0].client.execute_command('BF.EXISTS key b') == 1
+        assert self.client.execute_command('BF.INFO key ITEMS') == \
+            self.replicas[0].client.execute_command('BF.INFO key ITEMS')
+
+        # And digests must agree end-to-end.
+        primary_object_digest = self.client.execute_command('DEBUG DIGEST-VALUE key')
+        replica_object_digest = self.replicas[0].client.execute_command('DEBUG DIGEST-VALUE key')
+        assert primary_object_digest == replica_object_digest
+
+        # User-issued writes on the primary that genuinely exceed *its* limit
+        # are still rejected — the must-obey skip is replica-side only.
+        assert self.client.execute_command(
+            'CONFIG SET bf.bloom-memory-usage-limit 1024') == b'OK'
+        try:
+            self.client.execute_command(
+                'BF.INSERT user_key CAPACITY 100 ERROR 0.01 EXPANSION 2 '
+                'VALIDATESCALETO 1000000 ITEMS x')
+            assert False, "expected VALIDATESCALETO error on primary"
+        except ResponseError as e:
+            assert "VALIDATESCALETO" in str(e)

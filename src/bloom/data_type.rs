@@ -1,6 +1,9 @@
 use crate::bloom::utils::BloomFilter;
 use crate::bloom::utils::BloomObject;
 use crate::configs;
+use crate::configs::{
+    BLOOM_FP_RATE_MAX, BLOOM_FP_RATE_MIN, BLOOM_TIGHTENING_RATIO_MAX, BLOOM_TIGHTENING_RATIO_MIN,
+};
 use crate::wrapper::bloom_callback;
 use crate::MODULE_NAME;
 use std::os::raw::c_int;
@@ -69,14 +72,30 @@ impl ValkeyDataType for BloomObject {
         let Ok(fp_rate) = raw::load_double(rdb) else {
             return None;
         };
-
+        if !(fp_rate > BLOOM_FP_RATE_MIN && fp_rate < BLOOM_FP_RATE_MAX) {
+            logging::log_warning(
+                "Failed to restore bloom object: false positive rate out of range",
+            );
+            return None;
+        }
         let Ok(tightening_ratio) = raw::load_double(rdb) else {
             return None;
         };
+        if !(tightening_ratio > BLOOM_TIGHTENING_RATIO_MIN
+            && tightening_ratio < BLOOM_TIGHTENING_RATIO_MAX)
+        {
+            logging::log_warning("Failed to restore bloom object: tightening ratio out of range");
+            return None;
+        }
         let Ok(is_seed_random_u64) = raw::load_unsigned(rdb) else {
             return None;
         };
         let is_seed_random = is_seed_random_u64 == 1;
+        // Validate num_filters to prevent crashes from corrupt RDB data
+        if num_filters == 0 {
+            logging::log_warning("Failed to restore bloom object: num_filters must be at least 1");
+            return None;
+        }
         // We start off with capacity as 1 to match the same expansion of the vector that would have occurred during bloom
         // object creation and scaling as a result of BF.* operations.
         let mut filters = Vec::with_capacity(1);
@@ -86,6 +105,11 @@ impl ValkeyDataType for BloomObject {
             let Ok(capacity) = raw::load_unsigned(rdb) else {
                 return None;
             };
+            // Validate capacity to prevent crashes from corrupt RDB data
+            if capacity == 0 {
+                logging::log_warning("Failed to restore bloom object: capacity must be at least 1");
+                return None;
+            }
             let new_fp_rate = match Self::calculate_fp_rate(fp_rate, i as i32, tightening_ratio) {
                 Ok(rate) => rate,
                 Err(_) => {
@@ -115,6 +139,13 @@ impl ValkeyDataType for BloomObject {
             } else {
                 capacity
             };
+            // Validate num_items to prevent crashes from corrupt RDB data
+            if num_items > capacity {
+                logging::log_warning(
+                    "Failed to restore bloom object: num_items cannot exceed capacity",
+                );
+                return None;
+            }
             let Ok(bitmap) = raw::load_string_buffer(rdb) else {
                 return None;
             };
