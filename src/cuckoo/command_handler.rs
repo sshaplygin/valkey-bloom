@@ -778,7 +778,13 @@ pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
                 let field_name = args[2].to_string_lossy().to_uppercase();
                 return match field_name.as_str() {
                     "SIZE" => Ok(ValkeyValue::Integer(cuckoo.memory_usage() as i64)),
-                    "NUMBER OF BUCKETS" => Ok(ValkeyValue::Integer(cuckoo.num_filters() as i64)),
+                    "NUMBER OF BUCKETS" => Ok(ValkeyValue::Integer(
+                        cuckoo
+                            .filters()
+                            .iter()
+                            .map(|f| f.bucket_count() as i64)
+                            .sum(),
+                    )),
                     "NUMBER OF ITEMS INSERTED" => Ok(ValkeyValue::Integer(cuckoo.num_items())),
                     "NUMBER OF FILTERS" => Ok(ValkeyValue::Integer(cuckoo.num_filters() as i64)),
                     "BUCKET SIZE" => Ok(ValkeyValue::Integer(cuckoo.bucket_size() as i64)),

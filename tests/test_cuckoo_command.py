@@ -274,3 +274,11 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         with pytest.raises(ResponseError) as e:
             client.execute_command('CF.RESERVE bigfilter 10000')
         assert 'exceed' in str(e.value).lower() or 'limit' in str(e.value).lower()
+
+    def test_info_bucket_count_matches_allocated_buckets(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'buckets', 1000, 'BUCKETSIZE', 4)
+        info = client.execute_command('CF.INFO', 'buckets')
+        fields = dict(zip(info[::2], info[1::2]))
+        assert fields[b'Number of buckets'] == 256
+        assert client.execute_command('CF.INFO', 'buckets', 'NUMBER OF BUCKETS') == fields[b'Number of buckets']
