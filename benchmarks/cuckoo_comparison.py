@@ -17,6 +17,16 @@ import valkey
 CONFIGS = [(2, 20, 1), (4, 500, 2), (8, 1000, 4), (4, 500, 0)]
 
 
+def positive_int(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('must be a positive integer') from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return number
+
+
 def percentile(values, fraction):
     return sorted(values)[min(len(values) - 1, math.ceil(len(values) * fraction) - 1)]
 
@@ -93,9 +103,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--valkey-url', default='redis://127.0.0.1:6380')
     parser.add_argument('--rebloom-url', default='redis://127.0.0.1:6390')
-    parser.add_argument('--sizes', type=int, nargs='+', default=[10_000, 100_000, 1_000_000])
-    parser.add_argument('--repeats', type=int, default=3)
-    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--sizes', type=positive_int, nargs='+', default=[10_000, 100_000, 1_000_000])
+    parser.add_argument('--repeats', type=positive_int, default=3)
+    parser.add_argument('--batch-size', type=positive_int, default=512)
     parser.add_argument('--output', type=Path, default=Path('benchmarks/cuckoo-results.json'))
     args = parser.parse_args()
     clients = {'Valkey': valkey.Valkey.from_url(args.valkey_url),

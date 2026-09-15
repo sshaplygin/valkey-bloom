@@ -86,7 +86,7 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
             client.execute_command(
                 "CF.RESERVE", "cf_bench", capacity,
                 "BUCKETSIZE", bucket_size,
-                "EXPANSION", exp if exp > 0 else 1,
+                "EXPANSION", exp,
             )
             # Fill to capacity to trigger scaling (where applicable)
             for i in range(capacity):

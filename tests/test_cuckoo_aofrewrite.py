@@ -5,6 +5,7 @@ from valkey import ResponseError
 from valkey_bloom_test_case import ValkeyBloomTestCaseBase
 from valkey_test_case import ValkeyServerHandle
 from valkeytestframework.util.waiters import *
+from cuckoo_test_utils import rewrite_cuckoo_aof
 
 class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
 
@@ -12,13 +13,18 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
     def configure_aof(self, setup_test):
         # Persist appendonly in startup args so it survives server restarts
         self.server.args['appendonly'] = 'yes'
+        self.server.args['aof-use-rdb-preamble'] = 'no'
         client = self.server.get_new_client()
+        client.config_set('aof-use-rdb-preamble', 'no')
         client.execute_command('CONFIG', 'SET', 'appendonly', 'yes')
         time.sleep(0.5)
 
-    def test_basic_aof_rewrite(self):
+    @pytest.mark.parametrize('rdb_preamble', ['yes', 'no'])
+    def test_basic_aof_rewrite(self, rdb_preamble):
         """Test basic AOF rewrite for cuckoo filter"""
         client = self.server.get_new_client()
+        self.server.args['aof-use-rdb-preamble'] = rdb_preamble
+        client.config_set('aof-use-rdb-preamble', rdb_preamble)
 
         # Create and populate filter
         client.execute_command('CF.RESERVE', 'aofTest', 1000)
@@ -248,19 +254,11 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         client.execute_command('CF.RESERVE', 'loadCmdTest', 1000)
         client.execute_command('CF.ADD', 'loadCmdTest', 'item1')
 
-        # Trigger rewrite
-        client.execute_command('BGREWRITEAOF')
-        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
-
-        # Check AOF file contains CF.LOAD
-        # Note: This is implementation-specific and may need adjustment
-        # based on AOF file location
-        aof_file = client.info('persistence').get('aof_filename', 'appendonly.aof')
-
-        # The rewritten AOF should use CF.LOAD for compactness
-        # This is verified by the fact that data restores correctly
-        # and the AOF file should be smaller than incremental log
+        before = client.dump('loadCmdTest')
+        snapshots = rewrite_cuckoo_aof(client, self.server)
+        assert b'loadCmdTest' in snapshots
+        assert client.execute_command('CF.LOAD', 'loadedCopy', snapshots[b'loadCmdTest']) == b'OK'
+        assert client.dump('loadedCopy') == before
 
         # Restart to verify
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
@@ -269,3 +267,5 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
 
         exists = client.execute_command('CF.EXISTS', 'loadCmdTest', 'item1')
         assert exists == 1
+        assert client.dump('loadCmdTest') == before
+        assert client.dump('loadedCopy') == before

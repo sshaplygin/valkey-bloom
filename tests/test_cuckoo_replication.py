@@ -2,6 +2,7 @@ import os
 import pytest
 from valkey import ResponseError
 from valkeytestframework.valkey_test_case import ReplicationTestCase
+from cuckoo_test_utils import rewrite_cuckoo_aof
 
 class TestCuckooReplication(ReplicationTestCase):
 
@@ -150,8 +151,14 @@ class TestCuckooReplication(ReplicationTestCase):
         self.client.execute_command('CF.ADD', 'loadTest', 'item1')
         self.waitForReplicaToSyncUp(self.replicas[0])
 
-        exists = self.replicas[0].client.execute_command('CF.EXISTS', 'loadTest', 'item1')
-        assert exists == 1
+        snapshot = rewrite_cuckoo_aof(self.client, self.server)[b'loadTest']
+        replica = self.replicas[0].client
+        assert replica.exists('loaded') == 0
+        assert self.client.execute_command('CF.LOAD', 'loaded', snapshot) == b'OK'
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert replica.execute_command('CF.EXISTS', 'loaded', 'item1') == 1
+        assert self.client.dump('loadTest') == self.client.dump('loaded') == replica.dump('loaded')
+        assert self.client.execute_command('DEBUG', 'DIGEST-VALUE', 'loaded') == replica.execute_command('DEBUG', 'DIGEST-VALUE', 'loaded')
 
     def test_replication_after_reconnect(self):
         """Test replication resumes after connection loss"""

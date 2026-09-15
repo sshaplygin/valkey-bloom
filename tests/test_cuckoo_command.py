@@ -229,10 +229,9 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         client = self.server.get_new_client()
 
         # CF.LOAD requires serialized data from AOF rewrite; basic arity check
-        import pytest
-        with pytest.raises(Exception):
+        with pytest.raises(ResponseError, match='wrong number of arguments'):
             client.execute_command('CF.LOAD')
-        with pytest.raises(Exception):
+        with pytest.raises(ResponseError, match='wrong number of arguments'):
             client.execute_command('CF.LOAD key data extra')
 
     def test_argument_validation(self):

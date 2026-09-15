@@ -2,6 +2,7 @@ import time
 import pytest
 from valkey import ResponseError
 from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import rewrite_cuckoo_aof
 
 class TestCuckooKeyspace(ValkeyBloomTestCaseBase):
 
@@ -211,10 +212,18 @@ class TestCuckooKeyspace(ValkeyBloomTestCaseBase):
         # Create and serialize a filter using CF.LOAD roundtrip
         client.execute_command('CF.RESERVE', 'dumpTest', 100)
         client.execute_command('CF.ADD', 'dumpTest', 'item1')
+        snapshot = rewrite_cuckoo_aof(client, self.server)[b'dumpTest']
 
         # Subscribe to load events
-        pubsub = client.pubsub()
-        pubsub.psubscribe('__keyevent@0__:cuckoo.load')
-        time.sleep(0.1)
-
-        pubsub.close()
+        with client.pubsub() as pubsub:
+            pubsub.psubscribe('__keyevent@0__:cuckoo.load')
+            confirmation = pubsub.get_message(timeout=5)
+            assert confirmation is not None
+            assert confirmation['type'] == 'psubscribe'
+            assert client.execute_command('CF.LOAD', 'loaded', snapshot) == b'OK'
+            message = pubsub.get_message(timeout=5)
+            assert message is not None
+            assert message['type'] == 'pmessage'
+            assert message['channel'] == b'__keyevent@0__:cuckoo.load'
+            assert message['data'] == b'loaded'
+            assert client.dump('loaded') == client.dump('dumpTest')

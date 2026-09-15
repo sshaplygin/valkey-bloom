@@ -48,19 +48,18 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         """Test count functionality"""
         client = self.server.get_new_client()
 
-        # Add item multiple times (cuckoo filters can store duplicates)
+        # Duplicate additions preserve the 0/1 membership estimate.
         item = 'test_item'
         assert client.execute_command(f'CF.ADD myfilter {item}') == 1
 
-        # Count should be at least 1
+        # A present item has a membership estimate of 1.
         count = client.execute_command(f'CF.COUNT myfilter {item}')
-        assert count >= 1
+        assert count == 1
 
         # Add same item again
         client.execute_command(f'CF.ADD myfilter {item}')
         new_count = client.execute_command(f'CF.COUNT myfilter {item}')
-        # Count should not decrease
-        assert new_count >= count
+        assert new_count == 1
 
     def test_no_false_negatives(self):
         """Test that cuckoo filters don't have false negatives for added items"""
