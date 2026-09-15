@@ -10,7 +10,7 @@ This implementation stores one-byte fingerprints, not item strings or an occurre
 - Bucket size: 1 through 255 one-byte fingerprints per bucket (default 4).
 - Maximum iterations: 1 through 65535 eviction attempts (default 512).
 - Expansion: 0 disables scaling; 1 through 32768 scales the next subfilter by that factor (default 1). An object has at most 1024 subfilters.
-- The configured memory limit applies to actual allocated fingerprint storage and wrapper/vector sizes. Deleted capacity is reused before allocating another subfilter.
+- The configured memory limit applies to actual allocated fingerprint storage and wrapper/vector sizes. Allocated slots are used before scaling. Saturated subfilters are retried after a deletion frees capacity; this avoids repeating futile eviction work on every insert.
 
 `BUCKETSIZE` and `MAXITERATIONS` configure the underlying filter, rather than only its metadata. `CF.INFO` reports the actual number of allocated buckets.
 

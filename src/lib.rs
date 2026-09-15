@@ -16,6 +16,13 @@ use crate::cuckoo::data_type::CUCKOO_TYPE;
 use valkey_module::ModuleOptions;
 use valkey_module_macros::info_command_handler;
 
+// Unit tests run outside a server. Keep allocator selection local to this
+// target so building tests cannot enable the system allocator in the module.
+#[cfg(test)]
+use std::alloc::System as ModuleAllocator;
+#[cfg(not(test))]
+use valkey_module::alloc::ValkeyAlloc as ModuleAllocator;
+
 pub const MODULE_NAME: &str = "bf";
 pub const MODULE_VERSION: i32 = 999999;
 // The release stage is used in order to provide release status information.
@@ -166,7 +173,7 @@ fn info_handler(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> 
 valkey_module! {
     name: MODULE_NAME,
     version: MODULE_VERSION,
-    allocator: (valkey_module::alloc::ValkeyAlloc, valkey_module::alloc::ValkeyAlloc),
+    allocator: (ModuleAllocator, ModuleAllocator),
     data_types: [
         BLOOM_TYPE,
         CUCKOO_TYPE,
