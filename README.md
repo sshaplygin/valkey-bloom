@@ -19,12 +19,6 @@ BF.INSERT
 BF.LOAD
 ```
 
-## Cuckoo filters
-
-This branch also supports `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`, `CF.EXISTS`, `CF.MEXISTS`, `CF.DEL`, `CF.COUNT`, `CF.RESERVE`, `CF.INFO`, and `CF.LOAD`.
-
-Cuckoo filters store compact fingerprints, support deletion, and use deterministic eviction for replication. `CF.COUNT` is a 0/1 membership estimate; duplicate additions are idempotent. See [Cuckoo semantics, persistence, and benchmarking](docs/cuckoo.md).
-
 ## Build instructions
 ```
 curl https://sh.rustup.rs -sSf | sh
