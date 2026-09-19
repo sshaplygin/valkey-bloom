@@ -227,3 +227,15 @@ class TestCuckooKeyspace(ValkeyBloomTestCaseBase):
             assert message['channel'] == b'__keyevent@0__:cuckoo.load'
             assert message['data'] == b'loaded'
             assert client.dump('loaded') == client.dump('dumpTest')
+
+    def test_duplicate_add_emits_event_but_addnx_does_not(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.ADD', 'duplicate', 'item')
+        with client.pubsub() as pubsub:
+            pubsub.subscribe('__keyevent@0__:cuckoo.add')
+            assert pubsub.get_message(timeout=1)['type'] == 'subscribe'
+            assert client.execute_command('CF.ADDNX', 'duplicate', 'item') == 0
+            assert pubsub.get_message(timeout=0.1) is None
+            assert client.execute_command('CF.ADD', 'duplicate', 'item') == 1
+            message = pubsub.get_message(timeout=1)
+            assert message['data'] == b'duplicate'

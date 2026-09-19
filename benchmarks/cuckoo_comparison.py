@@ -40,6 +40,7 @@ def measure(client, label, count, config, repeat, batch_size):
                            'MAXITERATIONS', kicks, 'EXPANSION', expansion)
     latencies = []
     errors = 0
+    accepted = []
     started = time.perf_counter()
     for start in range(0, count, batch_size):
         stop = min(start + batch_size, count)
@@ -47,11 +48,14 @@ def measure(client, label, count, config, repeat, batch_size):
             for item in range(start, stop - 1):
                 pipe.execute_command('CF.ADD', key, f'item:{item}')
             results = pipe.execute(raise_on_error=False)
+        accepted.extend(not isinstance(result, valkey.ResponseError) for result in results)
         errors += sum(isinstance(result, valkey.ResponseError) for result in results)
         before = time.perf_counter_ns()
         try:
             client.execute_command('CF.ADD', key, f'item:{stop - 1}')
+            accepted.append(True)
         except valkey.ResponseError:
+            accepted.append(False)
             errors += 1
         latencies.append((time.perf_counter_ns() - before) / 1000)
     add_seconds = time.perf_counter() - started
@@ -60,18 +64,27 @@ def measure(client, label, count, config, repeat, batch_size):
     info = {k.decode(): v for k, v in zip(info[::2], info[1::2])}
     lookup_latencies = []
     hits = 0
+    successful_lookup_misses = 0
     started = time.perf_counter()
     for start in range(0, count, batch_size):
         stop = min(start + batch_size, count)
         with client.pipeline(transaction=False) as pipe:
             for item in range(start, stop - 1):
                 pipe.execute_command('CF.EXISTS', key, f'item:{item}')
-            hits += sum(pipe.execute())
+            replies = pipe.execute()
+            hits += sum(replies)
+            successful_lookup_misses += sum(ok and not hit for ok, hit in zip(accepted[start:stop - 1], replies))
         before = time.perf_counter_ns()
-        hits += client.execute_command('CF.EXISTS', key, f'item:{stop - 1}')
+        hit = client.execute_command('CF.EXISTS', key, f'item:{stop - 1}')
+        hits += hit
+        successful_lookup_misses += accepted[stop - 1] and not hit
         lookup_latencies.append((time.perf_counter_ns() - before) / 1000)
     lookup_seconds = time.perf_counter() - started
-    result = dict(implementation=label, items=count, capacity=capacity,
+    stored = info['Number of items inserted']
+    assert stored == sum(accepted), (label, stored, sum(accepted))
+    assert successful_lookup_misses == 0, (label, successful_lookup_misses)
+    result = dict(successful_inserts=sum(accepted), stored_fingerprints=stored,
+                  successful_lookup_misses=successful_lookup_misses, implementation=label, items=count, capacity=capacity,
                   bucket_size=bucket, max_iterations=kicks, expansion=expansion,
                   repeat=repeat, memory_bytes=memory, insert_errors=errors, lookup_hits=hits,
                   add_ops_per_second=count / add_seconds,

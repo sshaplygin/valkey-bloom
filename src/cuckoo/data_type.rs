@@ -1,4 +1,4 @@
-use crate::cuckoo::utils::{CuckooObject, CUCKOO_OBJECT_VERSION};
+use crate::cuckoo::utils::{CuckooFilter, CuckooObject, CUCKOO_OBJECT_VERSION};
 use crate::wrapper::cuckoo_callback;
 use std::os::raw::c_int;
 use valkey_module::digest::Digest;
@@ -51,35 +51,77 @@ impl ValkeyDataType for CuckooObject {
             logging::log_warning("Unsupported cuckoo persistence version.");
             return None;
         }
-        let data = raw::load_string_buffer(rdb).ok()?;
-        match Self::decode_object(data.as_ref(), true) {
-            Ok(object) => Some(object),
-            Err(err) => {
-                logging::log_warning(err.as_str());
-                None
+        fn load_header<const N: usize>(rdb: *mut raw::RedisModuleIO) -> Option<[u64; N]> {
+            let mut fields = [0; N];
+            for field in &mut fields {
+                *field = raw::load_unsigned(rdb).ok()?;
             }
+            Some(fields)
         }
+        let header @ [expansion, bucket_size, max_kicks, count] = load_header(rdb)?;
+        CuckooObject::validate_snapshot_header(header).ok()?;
+        let mut filters = Vec::with_capacity(1);
+        for _ in 0..count {
+            let header = load_header(rdb)?;
+            let size = CuckooFilter::validate_snapshot_header(header, bucket_size as usize).ok()?;
+            let data = raw::load_string_buffer(rdb).ok()?;
+            if data.as_ref().len() != size {
+                return None;
+            }
+            let filter = CuckooFilter::from_snapshot(
+                header,
+                data.as_ref().into(),
+                bucket_size as usize,
+                max_kicks as u32,
+            )
+            .ok()?;
+            filters.push(Box::new(filter));
+        }
+        let object = Self::from_existing(
+            expansion as u32,
+            bucket_size as usize,
+            max_kicks as u32,
+            filters,
+        );
+        if !Self::validate_size(object.memory_usage()) {
+            logging::log_warning(format!(
+                "Loaded cuckoo object using {} bytes, exceeding local memory limit {}.",
+                object.memory_usage(),
+                crate::configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            ));
+        }
+        Some(object)
     }
 
     fn debug_digest(&self, mut dig: Digest) {
-        // Include every fingerprint and the RNG position, not just item counts.
-        if let Ok(bytes) = self.encode_object() {
-            dig.add_string_buffer(&bytes);
+        for field in self.snapshot_header() {
+            dig.add_long_long(field as i64);
+        }
+        for filter in self.filters() {
+            for field in filter.snapshot_header() {
+                dig.add_long_long(field as i64);
+            }
+            dig.add_string_buffer(filter.as_bytes());
         }
         dig.end_sequence();
     }
 }
 
-/// Save a complete snapshot including the RNG stream position.
+/// Save directly from the bucket allocations without creating a snapshot buffer.
 ///
 /// # Safety
 /// `rdb` must be a valid Valkey persistence context.
 pub unsafe fn rdb_save_cuckoo_object(rdb: *mut raw::RedisModuleIO, value: &CuckooObject) {
-    match value.encode_object() {
-        Ok(data) => {
-            raw::RedisModule_SaveStringBuffer.unwrap()(rdb, data.as_ptr().cast(), data.len())
+    for field in value.snapshot_header() {
+        raw::RedisModule_SaveUnsigned.unwrap()(rdb, field);
+    }
+    for filter in value.filters() {
+        for field in filter.snapshot_header() {
+            raw::RedisModule_SaveUnsigned.unwrap()(rdb, field);
         }
-        Err(err) => logging::log_warning(err.as_str()),
+        let bytes = filter.as_bytes();
+        raw::RedisModule_SaveStringBuffer.unwrap()(rdb, bytes.as_ptr().cast(), bytes.len());
     }
 }
 

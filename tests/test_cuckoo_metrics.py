@@ -51,10 +51,10 @@ class TestCuckooMetrics(ValkeyBloomTestCaseBase):
         assert inserted > 0
         assert metrics(client)['num_items_across_objects'] == inserted
         assert client.execute_command('CF.ADD', 'items', 'item0') == 1
-        assert metrics(client)['num_items_across_objects'] == inserted
+        assert metrics(client)['num_items_across_objects'] == inserted + 1
         assert metrics(client)['total_memory_bytes'] == reserved_memory
         assert client.execute_command('CF.DEL', 'items', 'item0') == 1
-        assert metrics(client)['num_items_across_objects'] == inserted - 1
+        assert metrics(client)['num_items_across_objects'] == inserted
         assert client.delete('items') == 1
         assert metrics(client) == dict.fromkeys(METRICS, 0)
 

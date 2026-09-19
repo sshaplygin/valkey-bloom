@@ -24,7 +24,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         cf_exists_result_1 = client.execute_command('CF.EXISTS', 'testSave', 'item1')
         assert cf_exists_result_1 == 1
         cf_count_result_1 = client.execute_command('CF.COUNT', 'testSave', 'item1')
-        assert cf_count_result_1 == 1  # Repeated insertion retains one fingerprint
+        assert cf_count_result_1 == 2
         cf_info_result_1 = client.execute_command('CF.INFO', 'testSave')
         assert len(cf_info_result_1) != 0
 
@@ -60,7 +60,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         assert cf_exists_result_2 == 1
 
         cf_count_result_2 = client.execute_command('CF.COUNT', 'testSave', 'item1')
-        assert cf_count_result_2 == 1  # Membership estimate preserved
+        assert cf_count_result_2 == 2
 
         cf_info_result_2 = client.execute_command('CF.INFO', 'testSave')
         assert cf_info_result_2 == cf_info_result_1
@@ -95,7 +95,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
             exists = client.execute_command('CF.EXISTS', name, f'value{i}')
             assert exists == 1
             count_val = client.execute_command('CF.COUNT', name, f'value{i}')
-            assert count_val == 1
+            assert count_val == 2
 
     def test_save_with_deletions(self):
         """Test that deletions are preserved across save/restore"""
@@ -182,8 +182,8 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         count0_before = client.execute_command('CF.COUNT', 'countTest', 'item0')
         count1_before = client.execute_command('CF.COUNT', 'countTest', 'item1')
         count2_before = client.execute_command('CF.COUNT', 'countTest', 'item2')
-        assert count0_before == 1
-        assert count1_before == 1
+        assert count0_before == 5
+        assert count1_before == 3
         assert count2_before == 1
 
         # Save and restart
@@ -198,6 +198,19 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         count0_after = client.execute_command('CF.COUNT', 'countTest', 'item0')
         count1_after = client.execute_command('CF.COUNT', 'countTest', 'item1')
         count2_after = client.execute_command('CF.COUNT', 'countTest', 'item2')
-        assert count0_after == 1
-        assert count1_after == 1
+        assert count0_after == 5
+        assert count1_after == 3
         assert count2_after == 1
+
+    def test_rdb_load_ignores_local_memory_limit(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'large', 100000)
+        client.execute_command('CF.ADD', 'large', 'saved')
+        before = client.dump('large')
+        client.save()
+        client.config_set('bf.cuckoo-memory-usage-limit', 1024)
+        client.execute_command('DEBUG', 'RELOAD')
+        assert client.dump('large') == before
+        self.server.args['bf.cuckoo-memory-usage-limit'] = '1024'
+        self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
+        assert self.server.get_new_client().dump('large') == before

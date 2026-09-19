@@ -2,13 +2,13 @@
 Memory scaling analysis for the Cuckoo Filter.
 
 Measures CF.INFO Size under varying parameters and prints a Markdown table
-suitable for pasting into CUCKOO_IMPLEMENTATION_STATUS.md.
+for local benchmark analysis.
 
 Run with:
   SERVER_VERSION=unstable MODULE_PATH=<path>/libvalkey_bloom.dylib \
     python3 -m pytest tests/test_cuckoo_memory_scaling.py -v -s
 """
-import pytest
+from valkey import ResponseError
 from valkey_bloom_test_case import ValkeyBloomTestCaseBase
 
 
@@ -88,21 +88,28 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
                 "BUCKETSIZE", bucket_size,
                 "EXPANSION", exp,
             )
-            # Fill to capacity to trigger scaling (where applicable)
+            # A non-scaling cuckoo filter can exhaust its eviction budget before
+            # nominal capacity. Count actual successes instead of assuming a full fill.
+            inserted = 0
             for i in range(capacity):
-                client.execute_command("CF.ADD", "cf_bench", f"item{i}")
+                try:
+                    inserted += client.execute_command("CF.ADD", "cf_bench", f"item{i}")
+                except ResponseError as error:
+                    assert exp == 0 and 'non scaling cuckoo filter is full' in str(error)
+            assert inserted > 0
 
             info = client.execute_command("CF.INFO", "cf_bench")
             info_dict = {info[i]: info[i + 1] for i in range(0, len(info) - 1, 2)}
             size_key = b"Size" if b"Size" in info_dict else "Size"
             filters_key = b"Number of filters" if b"Number of filters" in info_dict else "Number of filters"
+            assert info_dict[b"Number of items inserted"] == inserted
             size = info_dict.get(size_key, "N/A")
             num_filters = info_dict.get(filters_key, "N/A")
-            rows.append((capacity, bucket_size, exp, num_filters, size))
+            rows.append((capacity, bucket_size, exp, inserted, num_filters, size))
 
         _print_table(
             "Memory after filling to capacity with different expansion rates (capacity=1000, bucket_size=4)",
-            ["Initial Capacity", "Bucket Size", "Expansion", "Num Filters", "Size (bytes)"],
+            ["Initial Capacity", "Bucket Size", "Expansion", "Inserted", "Num Filters", "Size (bytes)"],
             rows,
         )
         client.execute_command("DEL", "cf_bench")

@@ -148,7 +148,7 @@ pub unsafe extern "C" fn cuckoo_defrag(
         let cuckoo_filter = Box::into_raw(cuckoo_filter_box);
         let defrag_result = defrag.alloc(cuckoo_filter as *mut c_void);
 
-        let _defragged_filter = {
+        let mut defragged_filter = {
             if !defrag_result.is_null() {
                 metrics::CUCKOO_DEFRAG_HITS.fetch_add(1, Ordering::Relaxed);
                 Box::from_raw(defrag_result as *mut crate::cuckoo::utils::CuckooFilter)
@@ -158,10 +158,24 @@ pub unsafe extern "C" fn cuckoo_defrag(
             }
         };
 
+        defragged_filter.realloc_buckets(|buckets| {
+            let len = buckets.len();
+            let ptr = Box::into_raw(buckets).cast::<u8>();
+            let moved = defrag.alloc(ptr.cast());
+            let ptr = if moved.is_null() {
+                metrics::CUCKOO_DEFRAG_MISSES.fetch_add(1, Ordering::Relaxed);
+                ptr
+            } else {
+                metrics::CUCKOO_DEFRAG_HITS.fetch_add(1, Ordering::Relaxed);
+                moved.cast::<u8>()
+            };
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))
+        });
+
         // Reinsert the defragmented filter and increment the cursor
         cuckoo_object
             .filters_mut()
-            .insert(cursor as usize, _defragged_filter);
+            .insert(cursor as usize, defragged_filter);
         cursor += 1;
     }
 

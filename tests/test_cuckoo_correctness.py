@@ -48,7 +48,7 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         """Test count functionality"""
         client = self.server.get_new_client()
 
-        # Duplicate additions preserve the 0/1 membership estimate.
+        # Duplicate additions retain separate fingerprints.
         item = 'test_item'
         assert client.execute_command(f'CF.ADD myfilter {item}') == 1
 
@@ -59,7 +59,7 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         # Add same item again
         client.execute_command(f'CF.ADD myfilter {item}')
         new_count = client.execute_command(f'CF.COUNT myfilter {item}')
-        assert new_count == 1
+        assert new_count == 2
 
     def test_no_false_negatives(self):
         """Test that cuckoo filters don't have false negatives for added items"""
@@ -239,7 +239,7 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         # Note: Exact format depends on implementation
         assert info is not None
 
-    def test_duplicate_after_scaling_needs_only_one_delete(self):
+    def test_duplicate_after_scaling_needs_two_deletes(self):
         client = self.server.get_new_client()
         client.execute_command('CF.RESERVE', 'dedup', 8, 'EXPANSION', 2)
         client.execute_command('CF.ADD', 'dedup', 'original')
@@ -247,8 +247,10 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
             client.execute_command('CF.ADD', 'dedup', f'later-{i}')
         before = client.dump('dedup')
         client.execute_command('CF.ADD', 'dedup', 'original')
-        assert client.dump('dedup') == before
-        assert client.execute_command('CF.COUNT', 'dedup', 'original') == 1
+        assert client.dump('dedup') != before
+        assert client.execute_command('CF.COUNT', 'dedup', 'original') == 2
+        assert client.execute_command('CF.DEL', 'dedup', 'original') == 1
+        assert client.execute_command('CF.EXISTS', 'dedup', 'original') == 1
         assert client.execute_command('CF.DEL', 'dedup', 'original') == 1
         assert client.execute_command('CF.EXISTS', 'dedup', 'original') == 0
 

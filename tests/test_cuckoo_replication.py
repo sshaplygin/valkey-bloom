@@ -85,7 +85,7 @@ class TestCuckooReplication(ReplicationTestCase):
         self.waitForReplicaToSyncUp(self.replicas[0])
 
         count = self.replicas[0].client.execute_command('CF.COUNT', 'countRepl', 'item1')
-        assert count == 1
+        assert count == 3
 
     def test_scaling_filter_replication(self):
         """Test that filter scaling replicates correctly"""
@@ -226,3 +226,78 @@ class TestCuckooReplication(ReplicationTestCase):
             self.client.execute_command('CF.ADD', 'snapshot', f'value-{i}')
         self.waitForReplicaToSyncUp(self.replicas[0])
         assert self.client.dump('snapshot') == replica.dump('snapshot')
+
+    def test_nx_skipped_items_are_not_replayed_as_adds(self):
+        self.setup_replication(num_replicas=1)
+        c = self.client
+        c.execute_command('CF.ADD', 'nx', 'old')
+        c.execute_command('CF.ADD', 'nx', 'old')
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        offset = c.info('replication')['master_repl_offset']
+        assert c.execute_command('CF.ADDNX', 'nx', 'old') == 0
+        assert c.info('replication')['master_repl_offset'] == offset
+        assert c.execute_command('CF.INSERTNX', 'nx', 'ITEMS', 'old', 'new', 'old', 'new', 'last') == [0, 1, 0, 0, 1]
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert c.dump('nx') == self.replicas[0].client.dump('nx')
+        offset = c.info('replication')['master_repl_offset']
+        assert c.execute_command('CF.ADD', 'nx', 'old') == 1
+        assert c.info('replication')['master_repl_offset'] > offset
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert c.dump('nx') == self.replicas[0].client.dump('nx')
+
+    def test_full_sync_ignores_replica_memory_limit(self):
+        self.client.execute_command('CF.RESERVE', 'large', 100000)
+        self.client.execute_command('CF.ADD', 'large', 'saved')
+        self.args['bf.cuckoo-memory-usage-limit'] = '1024'
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        assert replica.dump('large') == self.client.dump('large')
+        self.client.execute_command('CF.ADD', 'large', 'next')
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert replica.dump('large') == self.client.dump('large')
+
+    def test_failed_eviction_then_raised_limit_replicates_identically(self):
+        self.setup_replication(num_replicas=1)
+        c = self.client
+        c.execute_command('CF.RESERVE', 'cached', 64, 'BUCKETSIZE', 4, 'MAXITERATIONS', 1, 'EXPANSION', 2)
+        size = dict(zip(*(iter(c.execute_command('CF.INFO', 'cached')),)*2))[b'Size']
+        c.config_set('bf.cuckoo-memory-usage-limit', size)
+        for i in range(1000):
+            try:
+                c.execute_command('CF.ADD', 'cached', f'item:{i}')
+            except ResponseError:
+                break
+        else:
+            assert False, 'Expected an eviction failure'
+        c.config_set('bf.cuckoo-memory-usage-limit', 256 * 1024 * 1024)
+        for j in range(i + 1, i + 200):
+            c.execute_command('CF.ADD', 'cached', f'item:{j}')
+            self.waitForReplicaToSyncUp(self.replicas[0])
+            assert c.dump('cached') == self.replicas[0].client.dump('cached')
+
+    def test_cached_failure_with_reusable_older_filter(self):
+        self.setup_replication(num_replicas=1)
+        c = self.client
+        c.execute_command('CF.RESERVE', 'cached-old', 64, 'BUCKETSIZE', 4,
+                          'MAXITERATIONS', 1, 'EXPANSION', 2)
+        for item in range(80):
+            c.execute_command('CF.ADD', 'cached-old', item.to_bytes(8, 'little'))
+        info = c.execute_command('CF.INFO', 'cached-old')
+        size = dict(zip(info[::2], info[1::2]))[b'Size']
+        c.config_set('bf.cuckoo-memory-usage-limit', size)
+        for item in range(80, 1000):
+            try:
+                c.execute_command('CF.ADD', 'cached-old', item.to_bytes(8, 'little'))
+            except ResponseError:
+                break
+        else:
+            assert False, 'Expected an eviction failure'
+        for item in range(32):
+            c.execute_command('CF.DEL', 'cached-old', item.to_bytes(8, 'little'))
+        for item in range(1000, 2000):
+            try:
+                c.execute_command('CF.ADD', 'cached-old', item.to_bytes(8, 'little'))
+            except ResponseError:
+                pass
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert c.dump('cached-old') == self.replicas[0].client.dump('cached-old')

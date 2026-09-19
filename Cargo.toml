@@ -16,9 +16,11 @@ valkey-module = { version = "0.1.5", features = ["min-valkey-compatibility-versi
 valkey-module-macros = "0"
 linkme = "0"
 bloomfilter = { version = "3.0.1", features = ["serde"] }
-cuckoofilter = { package = "valkey-cuckoo", version = "0.2" }
+cuckoofilter = { package = "valkey-cuckoo", version = "=0.2.0" }
 rand = "=0.8.8"
 rand_chacha = "=0.3.1"
+rand_core = "=0.6.4"
+ppv-lite86 = "=0.2.21"
 siphasher = "=1.0.3"
 lazy_static = "1.4.0"
 libc = "0.2"
@@ -43,6 +45,3 @@ enable-system-alloc = ["valkey-module/enable-system-alloc"]
 min-valkey-compatibility-version-8-0 = []
 valkey_8_0 = []  # Valkey-bloom is intended to be loaded on server versions >= Valkey 8.1 and by default it is built this way (unless this flag is provided). It is however compatible with Valkey version 8.0 if the user explicitly provides this feature flag in their cargo build command.
 use-redismodule-api = [] # We don't support this feature flag which is why it is empty. 
-
-[patch.crates-io]
-valkey-cuckoo = { git = "https://github.com/sshaplygin/rust-cuckoofilter", rev = "dbaa5d02894451a1185efc141a225ace775d8d2f" }

@@ -141,8 +141,8 @@ class TestCuckooDefrag(ValkeyBloomTestCaseBase):
         count1_after = client.execute_command('CF.COUNT', 'countDefrag', 'item1')
         count2_after = client.execute_command('CF.COUNT', 'countDefrag', 'item2')
 
-        assert count1_after == count1_before == 1
-        assert count2_after == count2_before == 1
+        assert count1_after == count1_before == 5
+        assert count2_after == count2_before == 3
 
     def test_defrag_filter_info_unchanged(self):
         """Test that CF.INFO results are unchanged after defrag"""
@@ -241,3 +241,31 @@ class TestCuckooDefrag(ValkeyBloomTestCaseBase):
         assert isinstance(misses, int)
         assert hits >= 0
         assert misses >= 0
+
+    def test_defrag_visits_buckets_and_preserves_digest(self):
+        from valkeytestframework.util.waiters import wait_for_equal
+        client = self.server.get_new_client()
+        client.config_set('activedefrag', 'no')
+        client.config_set('active-defrag-ignore-bytes', 1)
+        with client.pipeline(transaction=False) as pipe:
+            for i in range(2000):
+                pipe.execute_command('CF.RESERVE', f'buckets:{i}', 200)
+                pipe.execute_command('CF.INSERT', f'buckets:{i}', 'ITEMS', *[f'item:{j}' for j in range(20)])
+            pipe.execute()
+        client.delete(*[f'buckets:{i}' for i in range(0, 2000, 2)])
+        keys = [f'buckets:{i}' for i in range(1, 2000, 2)]
+        before = client.execute_command('DEBUG', 'DIGEST-VALUE', *keys)
+        baseline = client.info('modules')
+        client.config_set('activedefrag', 'yes')
+        wait_for_equal(lambda: client.info('modules')['bf_cuckoo_defrag_hits'] > baseline['bf_cuckoo_defrag_hits'], True)
+        client.config_set('activedefrag', 'no')
+        after = client.info('modules')
+        attempts = sum(after['bf_cuckoo_defrag_' + name] - baseline['bf_cuckoo_defrag_' + name]
+                       for name in ['hits', 'misses'])
+        # Each one-filter object visits the filter, buckets, vector, and object.
+        assert attempts > 0 and attempts % 4 == 0
+        assert client.execute_command('DEBUG', 'DIGEST-VALUE', *keys) == before
+        with client.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.execute_command('CF.MEXISTS', key, *[f'item:{j}' for j in range(20)])
+            assert all(result == [1] * 20 for result in pipe.execute())

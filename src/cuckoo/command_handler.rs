@@ -64,27 +64,30 @@ fn replicate_creation(
     ctx.replicate("CF.RESERVE", command.as_slice());
 }
 
-// Replay only the successfully processed prefix. Replaying the entire command
-// could insert extra items on a replica with a different local memory limit.
+// Replay actual insertions before the first error, omitting skipped NX items.
+// Replaying the whole command could add items the primary did not store.
 fn replicate_items(ctx: &Context, args: &[ValkeyString], item_idx: usize, response: &ValkeyResult) {
-    let count = match response {
-        Ok(ValkeyValue::Array(values)) => values
-            .iter()
-            .take_while(|v| matches!(v, ValkeyValue::Integer(_)))
-            .count(),
-        Ok(ValkeyValue::Integer(_)) => 1,
-        _ => 0,
-    };
-    if count == 0 {
-        return;
-    }
     let nocreate = ValkeyString::create_from_slice(std::ptr::null_mut(), b"NOCREATE");
     let items = ValkeyString::create_from_slice(std::ptr::null_mut(), b"ITEMS");
-    let mut command = vec![&args[1], &nocreate, &items];
-    command.extend(args[item_idx..item_idx + count].iter());
-    ctx.replicate("CF.INSERT", command.as_slice());
+    let mut command = Vec::with_capacity(3 + args.len() - item_idx);
+    command.extend([&args[1], &nocreate, &items]);
+    match response {
+        Ok(ValkeyValue::Array(values)) => command.extend(
+            values
+                .iter()
+                .zip(&args[item_idx..])
+                .take_while(|(v, _)| matches!(v, ValkeyValue::Integer(_)))
+                .filter_map(|(v, item)| matches!(v, ValkeyValue::Integer(1)).then_some(item)),
+        ),
+        Ok(ValkeyValue::Integer(1)) => command.push(&args[item_idx]),
+        _ => return,
+    }
+    if command.len() > 3 {
+        ctx.replicate("CF.INSERT", command.as_slice());
+    }
 }
 
+#[derive(Default)]
 struct InsertOptions {
     capacity: Option<i64>,
     bucket_size: Option<u8>,
@@ -170,48 +173,90 @@ fn parse_insert_options(
     Err(ValkeyError::Str(ITEMS_KEYWORD_REQUIRED))
 }
 
-fn handle_cuckoo_add(
+// All insertion commands share creation, partial success, replication and events.
+fn insert_items(
+    ctx: &Context,
     args: &[ValkeyString],
-    argc: usize,
+    options: InsertOptions,
     item_idx: usize,
-    cuckoo: &mut CuckooObject,
     multi: bool,
-    add_succeeded: &mut bool,
-    validate_size_limit: bool,
-) -> Result<ValkeyValue, ValkeyError> {
-    match multi {
-        true => {
-            let mut result = Vec::with_capacity(argc - item_idx);
-            let mut curr_cmd_idx = item_idx;
-            while curr_cmd_idx < argc {
-                let item = args[curr_cmd_idx].as_slice();
-                match cuckoo.add_item(item, validate_size_limit) {
-                    Ok(add_result) => {
-                        if add_result == 1 {
-                            *add_succeeded = true;
-                        }
-                        result.push(ValkeyValue::Integer(add_result));
-                    }
-                    Err(err) => {
-                        result.push(ValkeyValue::StaticError(err.as_str()));
-                        break;
-                    }
-                };
-                curr_cmd_idx += 1;
+    nx_mode: bool,
+    event: &str,
+) -> ValkeyResult {
+    let validate_size_limit = !must_obey_client(ctx);
+    let key_name = &args[1];
+    let filter_key = ctx.open_key_writable(key_name);
+    let value = filter_key
+        .get_value::<CuckooObject>(&CUCKOO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?;
+    let apply = |cuckoo: &mut CuckooObject| -> ValkeyResult {
+        let mut result = Vec::with_capacity(if multi { args.len() - item_idx } else { 0 });
+        for item in &args[item_idx..] {
+            let added = if nx_mode {
+                cuckoo.add_item_nx(item.as_slice(), validate_size_limit)
+            } else {
+                cuckoo.add_item(item.as_slice(), validate_size_limit)
+            };
+            if !multi {
+                return added
+                    .map(ValkeyValue::Integer)
+                    .map_err(|err| ValkeyError::Str(err.as_str()));
             }
-            Ok(ValkeyValue::Array(result))
-        }
-        false => {
-            let item = args[item_idx].as_slice();
-            match cuckoo.add_item(item, validate_size_limit) {
-                Ok(add_result) => {
-                    *add_succeeded = add_result == 1;
-                    Ok(ValkeyValue::Integer(add_result))
+            match added {
+                Ok(value) => result.push(ValkeyValue::Integer(value)),
+                Err(err) => {
+                    result.push(ValkeyValue::StaticError(err.as_str()));
+                    break;
                 }
-                Err(err) => Err(ValkeyError::Str(err.as_str())),
             }
         }
+        Ok(ValkeyValue::Array(result))
+    };
+    let response = if let Some(cuckoo) = value {
+        apply(cuckoo)
+    } else {
+        if options.nocreate {
+            return Err(ValkeyError::Str(NOT_FOUND));
+        }
+        let capacity = options
+            .capacity
+            .unwrap_or_else(|| configs::CUCKOO_CAPACITY.load(Ordering::Relaxed));
+        let bucket_size = options
+            .bucket_size
+            .map(usize::from)
+            .unwrap_or_else(|| configs::CUCKOO_BUCKET_SIZE.load(Ordering::Relaxed) as usize);
+        let max_kicks = options
+            .max_kicks
+            .unwrap_or_else(|| configs::CUCKOO_MAX_KICKS.load(Ordering::Relaxed) as u32);
+        let expansion = configs::CUCKOO_EXPANSION.load(Ordering::Relaxed) as u32;
+        let mut cuckoo = CuckooObject::new_reserved(
+            capacity,
+            bucket_size,
+            max_kicks,
+            expansion,
+            validate_size_limit,
+        )
+        .map_err(|err| ValkeyError::Str(err.as_str()))?;
+        let response = apply(&mut cuckoo);
+        filter_key
+            .set_value(&CUCKOO_TYPE, cuckoo)
+            .map_err(|_| ValkeyError::Str(FAILED_TO_SET_FILTER))?;
+        replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
+        ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
+        response
+    };
+    let changed = match &response {
+        Ok(ValkeyValue::Integer(1)) => true,
+        Ok(ValkeyValue::Array(values)) => {
+            values.iter().any(|v| matches!(v, ValkeyValue::Integer(1)))
+        }
+        _ => false,
+    };
+    if changed {
+        replicate_items(ctx, args, item_idx, &response);
+        ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     }
+    response
 }
 
 /// Implements CF.ADD and CF.MADD commands.
@@ -220,212 +265,34 @@ pub fn cuckoo_filter_add_value(
     args: Vec<ValkeyString>,
     multi: bool,
 ) -> ValkeyResult {
-    let argc = args.len();
-    if (!multi && argc != 3) || argc < 3 {
+    if (!multi && args.len() != 3) || args.len() < 3 {
         return Err(ValkeyError::WrongArity);
     }
-
-    let validate_size_limit = !must_obey_client(ctx);
-    let mut add_succeeded = false;
-    let curr_cmd_idx = 2;
-
-    let key_name = &args[1];
-
-    let filter_key = ctx.open_key_writable(key_name);
-    let value = match filter_key.get_value::<CuckooObject>(&CUCKOO_TYPE) {
-        Ok(v) => v,
-        Err(_) => return Err(ValkeyError::WrongType),
-    };
-
-    match value {
-        Some(cuckoo) => {
-            let response = handle_cuckoo_add(
-                &args,
-                argc,
-                curr_cmd_idx,
-                cuckoo,
-                multi,
-                &mut add_succeeded,
-                validate_size_limit,
-            );
-            if add_succeeded {
-                replicate_items(ctx, &args, curr_cmd_idx, &response);
-                ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
-            }
-            response
-        }
-        None => {
-            let capacity = configs::CUCKOO_CAPACITY.load(Ordering::Relaxed);
-            let bucket_size = configs::CUCKOO_BUCKET_SIZE.load(Ordering::Relaxed) as usize;
-            let max_kicks = configs::CUCKOO_MAX_KICKS.load(Ordering::Relaxed) as u32;
-            let expansion = configs::CUCKOO_EXPANSION.load(Ordering::Relaxed) as u32;
-
-            let mut cuckoo = match CuckooObject::new_reserved(
-                capacity,
-                bucket_size,
-                max_kicks,
-                expansion,
-                validate_size_limit,
-            ) {
-                Ok(cf) => cf,
-                Err(err) => return Err(ValkeyError::Str(err.as_str())),
-            };
-
-            let response = handle_cuckoo_add(
-                &args,
-                argc,
-                curr_cmd_idx,
-                &mut cuckoo,
-                multi,
-                &mut add_succeeded,
-                validate_size_limit,
-            );
-
-            match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
-                Ok(()) => {
-                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
-                    replicate_items(ctx, &args, curr_cmd_idx, &response);
-                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
-                    if add_succeeded {
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
-                    }
-                    response
-                }
-                Err(_) => Err(ValkeyError::Str(FAILED_TO_SET_FILTER)),
-            }
-        }
-    }
-}
-
-fn handle_cuckoo_addnx(
-    args: &[ValkeyString],
-    argc: usize,
-    item_idx: usize,
-    cuckoo: &mut CuckooObject,
-    multi: bool,
-    add_succeeded: &mut bool,
-    validate_size_limit: bool,
-) -> Result<ValkeyValue, ValkeyError> {
-    match multi {
-        true => {
-            let mut result = Vec::with_capacity(argc - item_idx);
-            let mut curr_cmd_idx = item_idx;
-            while curr_cmd_idx < argc {
-                let item = args[curr_cmd_idx].as_slice();
-                if cuckoo.item_exists(item) {
-                    result.push(ValkeyValue::Integer(0));
-                } else {
-                    match cuckoo.add_item(item, validate_size_limit) {
-                        Ok(add_result) => {
-                            if add_result == 1 {
-                                *add_succeeded = true;
-                            }
-                            result.push(ValkeyValue::Integer(add_result));
-                        }
-                        Err(err) => {
-                            result.push(ValkeyValue::StaticError(err.as_str()));
-                            break;
-                        }
-                    }
-                }
-                curr_cmd_idx += 1;
-            }
-            Ok(ValkeyValue::Array(result))
-        }
-        false => {
-            let item = args[item_idx].as_slice();
-            if cuckoo.item_exists(item) {
-                Ok(ValkeyValue::Integer(0))
-            } else {
-                match cuckoo.add_item(item, validate_size_limit) {
-                    Ok(add_result) => {
-                        *add_succeeded = add_result == 1;
-                        Ok(ValkeyValue::Integer(add_result))
-                    }
-                    Err(err) => Err(ValkeyError::Str(err.as_str())),
-                }
-            }
-        }
-    }
+    insert_items(
+        ctx,
+        &args,
+        InsertOptions::default(),
+        2,
+        multi,
+        false,
+        ADD_EVENT,
+    )
 }
 
 /// Implements CF.ADDNX and CF.MADDNX commands.
 pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>, multi: bool) -> ValkeyResult {
-    let argc = args.len();
-    if (!multi && argc != 3) || argc < 3 {
+    if (!multi && args.len() != 3) || args.len() < 3 {
         return Err(ValkeyError::WrongArity);
     }
-
-    let validate_size_limit = !must_obey_client(ctx);
-    let mut add_succeeded = false;
-    let curr_cmd_idx = 2;
-
-    let key_name = &args[1];
-
-    let filter_key = ctx.open_key_writable(key_name);
-    let value = match filter_key.get_value::<CuckooObject>(&CUCKOO_TYPE) {
-        Ok(v) => v,
-        Err(_) => return Err(ValkeyError::WrongType),
-    };
-
-    match value {
-        Some(cuckoo) => {
-            let response = handle_cuckoo_addnx(
-                &args,
-                argc,
-                curr_cmd_idx,
-                cuckoo,
-                multi,
-                &mut add_succeeded,
-                validate_size_limit,
-            );
-            if add_succeeded {
-                replicate_items(ctx, &args, curr_cmd_idx, &response);
-                ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
-            }
-            response
-        }
-        None => {
-            let capacity = configs::CUCKOO_CAPACITY.load(Ordering::Relaxed);
-            let bucket_size = configs::CUCKOO_BUCKET_SIZE.load(Ordering::Relaxed) as usize;
-            let max_kicks = configs::CUCKOO_MAX_KICKS.load(Ordering::Relaxed) as u32;
-            let expansion = configs::CUCKOO_EXPANSION.load(Ordering::Relaxed) as u32;
-
-            let mut cuckoo = match CuckooObject::new_reserved(
-                capacity,
-                bucket_size,
-                max_kicks,
-                expansion,
-                validate_size_limit,
-            ) {
-                Ok(cf) => cf,
-                Err(err) => return Err(ValkeyError::Str(err.as_str())),
-            };
-
-            let response = handle_cuckoo_addnx(
-                &args,
-                argc,
-                curr_cmd_idx,
-                &mut cuckoo,
-                multi,
-                &mut add_succeeded,
-                validate_size_limit,
-            );
-
-            match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
-                Ok(()) => {
-                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
-                    replicate_items(ctx, &args, curr_cmd_idx, &response);
-                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
-                    if add_succeeded {
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, ADD_EVENT, key_name);
-                    }
-                    response
-                }
-                Err(_) => Err(ValkeyError::Str(FAILED_TO_SET_FILTER)),
-            }
-        }
-    }
+    insert_items(
+        ctx,
+        &args,
+        InsertOptions::default(),
+        2,
+        multi,
+        true,
+        ADD_EVENT,
+    )
 }
 
 /// Implements CF.DEL command.
@@ -529,118 +396,11 @@ pub fn cuckoo_filter_insert(ctx: &Context, args: Vec<ValkeyString>, nx_mode: boo
         return Err(ValkeyError::WrongArity);
     }
 
-    let validate_size_limit = !must_obey_client(ctx);
-
-    let key_name = &args[1];
-
     let (options, items_idx) = parse_insert_options(&args, 2)?;
-
     if items_idx >= argc {
         return Err(ValkeyError::Str(NO_ITEMS_SPECIFIED));
     }
-
-    let mut add_succeeded = false;
-
-    let filter_key = ctx.open_key_writable(key_name);
-    let value = match filter_key.get_value::<CuckooObject>(&CUCKOO_TYPE) {
-        Ok(v) => v,
-        Err(_) => return Err(ValkeyError::WrongType),
-    };
-
-    match value {
-        Some(cuckoo) => {
-            let response = if nx_mode {
-                handle_cuckoo_addnx(
-                    &args,
-                    argc,
-                    items_idx,
-                    cuckoo,
-                    true,
-                    &mut add_succeeded,
-                    validate_size_limit,
-                )
-            } else {
-                handle_cuckoo_add(
-                    &args,
-                    argc,
-                    items_idx,
-                    cuckoo,
-                    true,
-                    &mut add_succeeded,
-                    validate_size_limit,
-                )
-            };
-
-            if add_succeeded {
-                replicate_items(ctx, &args, items_idx, &response);
-                ctx.notify_keyspace_event(NotifyEvent::MODULE, INSERT_EVENT, key_name);
-            }
-            response
-        }
-        None => {
-            if options.nocreate {
-                return Err(ValkeyError::Str(NOT_FOUND));
-            }
-
-            let capacity = options
-                .capacity
-                .unwrap_or_else(|| configs::CUCKOO_CAPACITY.load(Ordering::Relaxed));
-            let bucket_size = options
-                .bucket_size
-                .map(|b| b as usize)
-                .unwrap_or_else(|| configs::CUCKOO_BUCKET_SIZE.load(Ordering::Relaxed) as usize);
-            let max_kicks = options
-                .max_kicks
-                .unwrap_or_else(|| configs::CUCKOO_MAX_KICKS.load(Ordering::Relaxed) as u32);
-            let expansion = configs::CUCKOO_EXPANSION.load(Ordering::Relaxed) as u32;
-
-            let mut cuckoo = match CuckooObject::new_reserved(
-                capacity,
-                bucket_size,
-                max_kicks,
-                expansion,
-                validate_size_limit,
-            ) {
-                Ok(cf) => cf,
-                Err(err) => return Err(ValkeyError::Str(err.as_str())),
-            };
-
-            let response = if nx_mode {
-                handle_cuckoo_addnx(
-                    &args,
-                    argc,
-                    items_idx,
-                    &mut cuckoo,
-                    true,
-                    &mut add_succeeded,
-                    validate_size_limit,
-                )
-            } else {
-                handle_cuckoo_add(
-                    &args,
-                    argc,
-                    items_idx,
-                    &mut cuckoo,
-                    true,
-                    &mut add_succeeded,
-                    validate_size_limit,
-                )
-            };
-
-            match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
-                Ok(()) => {
-                    replicate_creation(ctx, key_name, capacity, bucket_size, max_kicks, expansion);
-                    replicate_items(ctx, &args, items_idx, &response);
-                    ctx.notify_keyspace_event(NotifyEvent::MODULE, CREATE_EVENT, key_name);
-                    if add_succeeded {
-                        ctx.notify_keyspace_event(NotifyEvent::MODULE, INSERT_EVENT, key_name);
-                    }
-                    response
-                }
-                Err(_) => Err(ValkeyError::Str(FAILED_TO_SET_FILTER)),
-            }
-        }
-    }
+    insert_items(ctx, &args, options, items_idx, true, nx_mode, INSERT_EVENT)
 }
 
 /// Implements CF.RESERVE command.

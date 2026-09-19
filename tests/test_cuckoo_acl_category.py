@@ -59,3 +59,7 @@ class TestCuckooACLCategory(ValkeyBloomTestCaseBase):
         finally:
             restricted.close()
             client.execute_command('ACL', 'DELUSER', 'reader')
+
+    def test_eviction_commands_are_not_fast(self):
+        fast = category_commands(self.server.get_new_client(), 'fast')
+        assert not {'cf.add', 'cf.addnx', 'cf.insert', 'cf.insertnx'} & fast
