@@ -39,6 +39,7 @@ pub const ITEMS_KEYWORD_REQUIRED: &str = "ERR ITEMS keyword required";
 pub const UNKNOWN_OPTION_OR_MISSING_ITEMS: &str = "ERR unknown option or missing ITEMS keyword";
 pub const UNKNOWN_OPTION: &str = "ERR unknown option";
 pub const EXCEEDS_MAX_CUCKOO_SIZE: &str = "ERR operation exceeds cuckoo object memory limit";
+pub const MAX_SCALING_CAPACITY: &str = "ERR cuckoo object reached max capacity";
 pub const MAX_NUM_SCALING_FILTERS: &str = "ERR cuckoo object reached max number of filters";
 pub const DECODE_CUCKOO_OBJECT_FAILED: &str = "ERR cuckoo object decoding failed";
 pub const DECODE_UNSUPPORTED_VERSION: &str =
@@ -57,6 +58,7 @@ pub enum CuckooError {
     FilterFull,
     ExceedsMaxSize,
     MaxNumScalingFilters,
+    MaxScalingCapacity,
     BadCapacity,
     BadBucketSize,
     BadMaxKicks,
@@ -72,6 +74,7 @@ impl CuckooError {
             CuckooError::FilterFull => FILTER_FULL,
             CuckooError::ExceedsMaxSize => EXCEEDS_MAX_CUCKOO_SIZE,
             CuckooError::MaxNumScalingFilters => MAX_NUM_SCALING_FILTERS,
+            CuckooError::MaxScalingCapacity => MAX_SCALING_CAPACITY,
             CuckooError::BadCapacity => BAD_CAPACITY,
             CuckooError::BadBucketSize => BAD_BUCKET_SIZE,
             CuckooError::BadMaxKicks => BAD_MAX_KICKS,
@@ -219,16 +222,16 @@ impl CuckooObject {
         hash: &ItemHash,
         validate_size_limit: bool,
     ) -> Result<i64, CuckooError> {
-        // Version 5: reuse any directly available slot before spending RNG and
+        // Reuse any directly available slot before spending RNG and
         // MAXITERATIONS evictions in the newest filter. Keep newest-first order
         // within this direct pass, independently of the local growth limit.
         for filter in self.filters.iter_mut().rev() {
-            if !filter.sealed && filter.add_hashed(hash, false).is_ok() {
+            if filter.add_hashed(hash, false).is_ok() {
                 return Ok(1);
             }
         }
         let newest = self.filters.last_mut().expect("at least one filter");
-        if !newest.sealed && newest.add_hashed(hash, true).is_ok() {
+        if newest.add_hashed(hash, true).is_ok() {
             return Ok(1);
         }
         let capacity = self.scaling_capacity(validate_size_limit)?;
@@ -238,11 +241,6 @@ impl CuckooObject {
             self.max_kicks,
         ));
         filter.add_hashed(hash, true)?;
-        // Retry saturated filters only after a deletion frees capacity. Seal
-        // them only after a successful scale, so failed commands change no state.
-        for previous in &mut self.filters {
-            previous.sealed = true;
-        }
         let before = self.cuckoo_object_memory_usage();
         self.filters.push(filter);
         crate::metrics::CUCKOO_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(
@@ -266,7 +264,7 @@ impl CuckooObject {
             .capacity()
             .checked_mul(self.expansion.into())
             .filter(|n| *n <= configs::CUCKOO_CAPACITY_MAX)
-            .ok_or(CuckooError::BadCapacity)?;
+            .ok_or(CuckooError::MaxScalingCapacity)?;
         if validate_size_limit && !self.validate_size_before_scaling(capacity, self.bucket_size) {
             return Err(CuckooError::ExceedsMaxSize);
         }
@@ -539,7 +537,7 @@ impl Drop for CuckooObject {
 }
 
 // SipHash-1-3 with fixed keys and canonical length encoding. Keep hashing
-// unchanged for the lifetime of persistence versions 3 through 5.
+// unchanged for the lifetime of the snapshot format.
 #[derive(Clone, Default)]
 pub struct FixedHasher(siphasher::sip::SipHasher13);
 impl Hasher for FixedHasher {
@@ -561,7 +559,6 @@ pub struct CuckooFilter {
     filter: ExternalFilter,
     capacity: i64,
     bucket_size: usize,
-    sealed: bool,
 }
 
 impl CuckooFilter {
@@ -577,7 +574,6 @@ impl CuckooFilter {
             filter,
             capacity,
             bucket_size,
-            sealed: false,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         result
@@ -590,7 +586,7 @@ impl CuckooFilter {
             self.filter.len() as u64,
             position as u64,
             (position >> 64) as u64,
-            u64::from(self.sealed),
+            0, // Reserved; must remain zero.
             self.as_bytes().len() as u64,
         ]
     }
@@ -599,11 +595,11 @@ impl CuckooFilter {
         fields: [u64; 6],
         bucket_size: usize,
     ) -> Result<usize, CuckooError> {
-        let [capacity, length, _, high, sealed, size] = fields;
+        let [capacity, length, _, high, reserved, size] = fields;
         if !(configs::CUCKOO_CAPACITY_MIN as u64..=configs::CUCKOO_CAPACITY_MAX as u64)
             .contains(&capacity)
             || high >= 16
-            || sealed > 1
+            || reserved != 0
             || length > size
         {
             return Err(CuckooError::DecodeFilterFailed);
@@ -628,7 +624,7 @@ impl CuckooFilter {
         if size != values.len() {
             return Err(CuckooError::DecodeFilterFailed);
         }
-        let [capacity, length, low, high, sealed, _] = fields;
+        let [capacity, length, low, high, _, _] = fields;
         let mut rng = ChaCha8Rng::seed_from_u64(RNG_SEED);
         rng.set_word_pos(u128::from(low) | (u128::from(high) << 64));
         let filter = ExternalFilter::from_bytes_with_rng(
@@ -643,7 +639,6 @@ impl CuckooFilter {
             filter,
             capacity: capacity as i64,
             bucket_size,
-            sealed: sealed != 0,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         Ok(result)
@@ -677,7 +672,6 @@ impl CuckooFilter {
     fn delete_hashed(&mut self, hash: &ItemHash) -> bool {
         let deleted = self.filter.delete_hashed(hash);
         if deleted {
-            self.sealed = false;
             crate::metrics::CUCKOO_NUM_ITEMS_ACROSS_OBJECTS.fetch_sub(1, Ordering::Relaxed);
         }
         deleted
@@ -699,7 +693,6 @@ impl CuckooFilter {
             filter: from.filter.clone(),
             capacity: from.capacity,
             bucket_size: from.bucket_size,
-            sealed: from.sealed,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         result
@@ -976,7 +969,6 @@ mod tests {
         let mut old = CuckooFilter::new(64, 4, 20);
         let deleted = ExternalFilter::hash_item(b"deleted".as_slice());
         old.add_hashed(&deleted, false).unwrap();
-        old.sealed = true;
         assert!(old.delete_hashed(&deleted));
         let mut object =
             CuckooObject::from_existing(2, 4, 20, vec![Box::new(old), Box::new(newest)], 0);
@@ -989,6 +981,91 @@ mod tests {
         assert_eq!(object.filters[0].num_items(), 1);
         assert_eq!(object.filters[1].snapshot_header(), before_header);
         assert_eq!(object.filters[1].as_bytes(), before_buckets);
+    }
+
+    #[test]
+    fn scaling_keeps_old_direct_slots_available() {
+        let mut object = CuckooObject::new_reserved(64, 2, 20, 1, false).unwrap();
+        let mut at_first_scale = None;
+        for item in 0..200 {
+            object
+                .add_item(format!("item:{item}").as_bytes(), false)
+                .unwrap();
+            if object.num_filters() == 2 && at_first_scale.is_none() {
+                at_first_scale = Some(object.filters[0].num_items());
+            }
+        }
+        assert!(object.filters[0].num_items() > at_first_scale.unwrap());
+        assert_eq!(object.num_deleted(), 0);
+        // Pin placement across scaling, including direct reuse of older filters.
+        let mut digest = FixedHasher::default();
+        digest.write(&object.encode_object());
+        assert_eq!(
+            digest.finish(),
+            8_107_312_244_792_314_012,
+            "scaled placement fixture"
+        );
+    }
+
+    #[test]
+    fn capacity_ceiling_preserves_failed_insertion_state() {
+        // Model the requested capacity independently of backing storage so the
+        // ceiling check does not require a multi-GiB allocation in unit tests.
+        let backing = ExternalFilter::from_bytes_with_rng(
+            vec![7; 4].into_boxed_slice(),
+            4,
+            4,
+            20,
+            ChaCha8Rng::seed_from_u64(RNG_SEED),
+        )
+        .unwrap();
+        let filter = CuckooFilter {
+            filter: backing,
+            capacity: (1_i64 << 31) + 1,
+            bucket_size: 4,
+        };
+        filter.cuckoo_filter_incr_metrics_on_new_create();
+        let mut object = CuckooObject::from_existing(2, 4, 20, vec![Box::new(filter)], 0);
+        let before = object.encode_object();
+        // Bypass the local memory limit; the arithmetic ceiling is unconditional.
+        assert_eq!(
+            object.add_item(b"overflow", false),
+            Err(CuckooError::MaxScalingCapacity)
+        );
+        assert_eq!(object.encode_object(), before);
+        assert_eq!(
+            CuckooError::MaxScalingCapacity.as_str(),
+            "ERR cuckoo object reached max capacity"
+        );
+    }
+
+    #[test]
+    fn copy_and_snapshot_match_probes_after_first_failure() {
+        for kicks in [1, 20, 512] {
+            let mut original = CuckooObject::new_reserved(1024, 4, kicks, 0, false).unwrap();
+            let first_failure = (0..2000)
+                .find(|i| {
+                    original
+                        .add_item(format!("item:{i}").as_bytes(), false)
+                        .is_err()
+                })
+                .expect("the non-scaling filter must reject an insertion");
+            let mut copy = CuckooObject::create_copy_from(&original);
+            let mut restored =
+                CuckooObject::decode_object(&original.encode_object(), false).unwrap();
+            for i in first_failure + 1..first_failure + 3001 {
+                let key = format!("item:{i}");
+                let before = original.encode_object();
+                let result = original.add_item(key.as_bytes(), false);
+                assert_eq!(result, copy.add_item(key.as_bytes(), false));
+                assert_eq!(result, restored.add_item(key.as_bytes(), false));
+                assert_eq!(original.encode_object(), copy.encode_object());
+                assert_eq!(original.encode_object(), restored.encode_object());
+                if result.is_err() {
+                    assert_eq!(original.encode_object(), before);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1162,14 +1239,23 @@ mod tests {
     #[test]
     fn filter_count_limit_keeps_evictions_and_old_slots_available() {
         let mut filters = Vec::new();
-        for _ in 0..CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX {
-            let mut filter = CuckooFilter::new(64, 4, 1);
-            filter.sealed = true;
-            filters.push(Box::new(filter));
+        // All older filters are actually full; only the newest has spare slots.
+        for _ in 0..CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX - 1 {
+            filters.push(Box::new(
+                CuckooFilter::from_snapshot(
+                    [64, 64, 0, 0, 0, 64],
+                    vec![7; 64].into_boxed_slice(),
+                    4,
+                    1,
+                )
+                .unwrap(),
+            ));
         }
-        let old_hash = ExternalFilter::hash_item(b"old sentinel".as_slice());
-        filters[0].add_hashed(&old_hash, false).unwrap();
-        filters.last_mut().unwrap().sealed = false;
+        filters.push(Box::new(CuckooFilter::new(64, 4, 1)));
+        let old_hash = (0..10000)
+            .map(|i| ExternalFilter::hash_item(i.to_string().as_bytes()))
+            .find(|hash| filters[0].filter.contains_hashed(hash))
+            .unwrap();
         let mut original = CuckooObject::from_existing(2, 4, 1, filters, 0);
         let mut failures = 0;
         let mut accepted_after_failure = 0;
@@ -1229,7 +1315,7 @@ mod tests {
         let rate = positives as f64 / 100_000.0;
         assert!((0.018..0.04).contains(&rate), "FPR: {rate}");
     }
-    // Captured from dbaa5d0 before changing bucket storage or insertion dispatch.
+    // Fixed single-filter bucket and RNG fixture for the published dependency.
     // Do not regenerate these values merely to accommodate a failing test.
     const EXPECTED_BUCKETS: [u8; 64] = [
         142, 84, 122, 190, 253, 101, 202, 223, 168, 103, 141, 47, 221, 105, 221, 15, 50, 229, 147,

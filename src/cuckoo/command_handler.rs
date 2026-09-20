@@ -507,6 +507,21 @@ pub fn cuckoo_filter_reserve(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyRe
     }
 }
 
+// Keep response labels and accessors shared by full and single-field replies.
+type InfoField = (&'static str, fn(&CuckooObject) -> i64);
+const INFO_FIELDS: [InfoField; 8] = [
+    ("Size", |c| c.memory_usage() as i64),
+    ("Number of buckets", |c| {
+        c.filters().iter().map(|f| f.bucket_count() as i64).sum()
+    }),
+    ("Number of items inserted", CuckooObject::num_items),
+    ("Number of items deleted", CuckooObject::num_deleted),
+    ("Number of filters", |c| c.num_filters() as i64),
+    ("Bucket size", |c| c.bucket_size() as i64),
+    ("Max iterations", |c| c.max_kicks() as i64),
+    ("Expansion rate", |c| c.expansion() as i64),
+];
+
 /// Implements CF.INFO command.
 pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let argc = args.len();
@@ -525,49 +540,22 @@ pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
     match value {
         Some(cuckoo) => {
             if argc == 3 {
-                let field_name = args[2].to_string_lossy().to_uppercase();
-                return match field_name.as_str() {
-                    "SIZE" => Ok(ValkeyValue::Integer(cuckoo.memory_usage() as i64)),
-                    "NUMBER OF BUCKETS" => Ok(ValkeyValue::Integer(
-                        cuckoo
-                            .filters()
-                            .iter()
-                            .map(|f| f.bucket_count() as i64)
-                            .sum(),
-                    )),
-                    "NUMBER OF ITEMS INSERTED" => Ok(ValkeyValue::Integer(cuckoo.num_items())),
-                    "NUMBER OF ITEMS DELETED" => Ok(ValkeyValue::Integer(cuckoo.num_deleted())),
-                    "NUMBER OF FILTERS" => Ok(ValkeyValue::Integer(cuckoo.num_filters() as i64)),
-                    "BUCKET SIZE" => Ok(ValkeyValue::Integer(cuckoo.bucket_size() as i64)),
-                    "MAX ITERATIONS" => Ok(ValkeyValue::Integer(cuckoo.max_kicks() as i64)),
-                    "EXPANSION RATE" => Ok(ValkeyValue::Integer(cuckoo.expansion() as i64)),
-                    _ => Err(ValkeyError::Str(UNKNOWN_OPTION)),
-                };
+                let field_name = args[2].to_string_lossy();
+                return INFO_FIELDS
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&field_name))
+                    .map(|(_, value)| ValkeyValue::Integer(value(cuckoo)))
+                    .ok_or(ValkeyError::Str(UNKNOWN_OPTION));
             }
-            let result = vec![
-                ValkeyValue::SimpleStringStatic("Size"),
-                ValkeyValue::Integer(cuckoo.memory_usage() as i64),
-                ValkeyValue::SimpleStringStatic("Number of buckets"),
-                ValkeyValue::Integer(
-                    cuckoo
-                        .filters()
-                        .iter()
-                        .map(|f| f.bucket_count() as i64)
-                        .sum(),
-                ),
-                ValkeyValue::SimpleStringStatic("Number of items inserted"),
-                ValkeyValue::Integer(cuckoo.num_items()),
-                ValkeyValue::SimpleStringStatic("Number of items deleted"),
-                ValkeyValue::Integer(cuckoo.num_deleted()),
-                ValkeyValue::SimpleStringStatic("Number of filters"),
-                ValkeyValue::Integer(cuckoo.num_filters() as i64),
-                ValkeyValue::SimpleStringStatic("Bucket size"),
-                ValkeyValue::Integer(cuckoo.bucket_size() as i64),
-                ValkeyValue::SimpleStringStatic("Max iterations"),
-                ValkeyValue::Integer(cuckoo.max_kicks() as i64),
-                ValkeyValue::SimpleStringStatic("Expansion rate"),
-                ValkeyValue::Integer(cuckoo.expansion() as i64),
-            ];
+            let result = INFO_FIELDS
+                .iter()
+                .flat_map(|(name, value)| {
+                    [
+                        ValkeyValue::SimpleStringStatic(name),
+                        ValkeyValue::Integer(value(cuckoo)),
+                    ]
+                })
+                .collect();
             Ok(ValkeyValue::Array(result))
         }
         None => Err(ValkeyError::Str(NOT_FOUND)),
@@ -584,11 +572,6 @@ pub fn cuckoo_filter_load(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
     let key_name = &args[1];
     let data = args[2].as_slice();
 
-    let cuckoo = match CuckooObject::decode_object(data, !must_obey_client(ctx)) {
-        Ok(cf) => cf,
-        Err(err) => return Err(ValkeyError::Str(err.as_str())),
-    };
-
     let filter_key = ctx.open_key_writable(key_name);
     let value = match filter_key.get_value::<CuckooObject>(&CUCKOO_TYPE) {
         Ok(v) => v,
@@ -598,6 +581,11 @@ pub fn cuckoo_filter_load(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
     if value.is_some() {
         return Err(ValkeyError::Str(ITEM_EXISTS));
     }
+
+    let cuckoo = match CuckooObject::decode_object(data, !must_obey_client(ctx)) {
+        Ok(cf) => cf,
+        Err(err) => return Err(ValkeyError::Str(err.as_str())),
+    };
 
     match filter_key.set_value(&CUCKOO_TYPE, cuckoo) {
         Ok(()) => {

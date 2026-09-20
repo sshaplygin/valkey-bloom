@@ -32,6 +32,29 @@ def rdb_bucket_chunk(data):
 
 
 class TestCuckooSnapshotValidation(CuckooTestCase):
+    @pytest.mark.parametrize('key_type,error', [('cuckoo', '^item exists$'), ('string', '^WRONGTYPE')])
+    def test_load_checks_existing_key_before_decoding(self, key_type, error):
+        client = self.server.get_new_client()
+        if key_type == 'cuckoo':
+            client.execute_command('CF.ADD', 'existing', 'saved')
+        else:
+            client.set('existing', 'saved')
+        before = client.dump('existing')
+        memory = client.memory_usage('existing')
+        metrics = client.info('modules')
+        client.config_set('bf.cuckoo-memory-usage-limit', 1024)
+        # Invalid and over-limit payloads would fail decoding. The destination
+        # error must win, proving the snapshot decoder was not entered.
+        for payload in [b'invalid', empty_snapshot([1048576])]:
+            with pytest.raises(ResponseError, match=error):
+                client.execute_command('CF.LOAD', 'existing', payload)
+            assert client.dump('existing') == before
+            assert client.memory_usage('existing') == memory
+            after = client.info('modules')
+            for name, value in metrics.items():
+                if name.startswith('bf_cuckoo_') and 'defrag' not in name:
+                    assert after[name] == value, name
+
     def test_invalid_rdb_chunks_leave_server_alive_and_metrics_unchanged(self):
         client = self.server.get_new_client()
         client.execute_command('CF.RESERVE', 'template', 32)
@@ -113,7 +136,7 @@ class TestCuckooSnapshotValidation(CuckooTestCase):
         invalid += [bytes([version]) + snapshot[1:] for version in [1, 2, 3, 4, 255]]
         invalid += [snapshot + b'extra']
         for offset, value in [(25, 1025), (33, 2**63), (41, 2**64 - 1),
-                              (49, 1), (65, 16), (73, 2), (81, 2**64 - 1)]:
+                              (49, 1), (65, 16), (73, 1), (73, 2), (81, 2**64 - 1)]:
             invalid.append(snapshot[:offset] + struct.pack('<Q', value) + snapshot[offset + 8:])
         metrics = client.info('modules')
         for data in invalid:
