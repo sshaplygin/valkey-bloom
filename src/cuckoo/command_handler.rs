@@ -59,7 +59,7 @@ fn replicate_creation(
     ctx.replicate("CF.RESERVE", command.as_slice());
 }
 
-// Replay actual insertions before the first error, omitting skipped NX items.
+// Replay actual batch insertions before the first error, omitting skipped NX items.
 // Replaying the whole command could add items the primary did not store.
 fn replicate_items(ctx: &Context, args: &[ValkeyString], item_idx: usize, response: &ValkeyResult) {
     let nocreate = ValkeyString::create_from_slice(std::ptr::null_mut(), b"NOCREATE");
@@ -73,7 +73,6 @@ fn replicate_items(ctx: &Context, args: &[ValkeyString], item_idx: usize, respon
                 .zip(&args[item_idx..])
                 .filter_map(|(v, item)| matches!(v, ValkeyValue::Integer(1)).then_some(item)),
         ),
-        Ok(ValkeyValue::Integer(1)) => command.push(&args[item_idx]),
         _ => return,
     }
     if command.len() > 3 {
@@ -93,12 +92,7 @@ fn parse_insert_options(
     args: &[ValkeyString],
     start_idx: usize,
 ) -> Result<(InsertOptions, usize), ValkeyError> {
-    let mut options = InsertOptions {
-        capacity: None,
-        bucket_size: None,
-        max_kicks: None,
-        nocreate: false,
-    };
+    let mut options = InsertOptions::default();
 
     let mut curr_idx = start_idx;
     let argc = args.len();
@@ -247,7 +241,12 @@ fn insert_items(
         _ => false,
     };
     if changed {
-        replicate_items(ctx, args, item_idx, &response);
+        if multi {
+            replicate_items(ctx, args, item_idx, &response);
+        } else {
+            // Preserve CF.ADD/CF.ADDNX keyspace events on replicas.
+            ctx.replicate_verbatim();
+        }
         ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     }
     response

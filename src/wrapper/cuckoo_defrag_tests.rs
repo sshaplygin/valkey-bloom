@@ -242,8 +242,8 @@ unsafe fn relocation_case(capacity: i64, delete_items: bool, move_allocations: b
     assert_eq!(after.delete_item(b"duplicate").unwrap(), 1);
     assert_eq!(after.count_item(b"duplicate"), duplicate_count - 1);
     // Exercise the production free callback before checking the move criterion,
-    // including in the negative control. Local Rust ASAN runs also check this
-    // ownership transfer (see docs/cuckoo.md for the command).
+    // including in the negative control. The Rust ASAN CI job checks this
+    // ownership transfer (see docs/cuckoo.md for local reproduction).
     drop(owned);
     for kind in [Kind::Filter, Kind::Buckets, Kind::Vector, Kind::Object] {
         let allocations: Vec<_> = mover
@@ -321,8 +321,7 @@ fn defrag_relocates_owned_allocations() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        // These checks detect diagnostics when this test is run under Rust ASAN
-        // locally; ordinary cargo test CI jobs do not instrument this harness.
+        // Check child diagnostics in the Rust ASAN CI job and local sanitizer runs.
         assert!(!report.contains("ERROR: AddressSanitizer"), "{report}");
         assert!(!report.contains("LeakSanitizer"), "{report}");
         if mode == "move" {

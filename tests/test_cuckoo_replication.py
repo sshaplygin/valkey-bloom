@@ -50,6 +50,50 @@ class TestCuckooReplication(ReplicationTestCase):
         exists = self.replicas[0].client.execute_command('CF.EXISTS', 'replTest', 'item1')
         assert exists == 1
 
+    @pytest.mark.parametrize('command', ['CF.ADD', 'CF.ADDNX', 'CF.INSERT', 'CF.INSERTNX'])
+    @pytest.mark.parametrize('reserve', [False, True])
+    def test_insertion_keyspace_event_parity(self, command, reserve):
+        """Replicas publish the same insertion event, including repeated NX calls."""
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        key = 'eventParity'
+        if reserve:
+            self.client.execute_command('CF.RESERVE', key, 64)
+            self.waitForReplicaToSyncUp(self.replicas[0])
+        for client in (self.client, replica):
+            client.config_set('notify-keyspace-events', 'AKEm')
+
+        channels = [b'__keyevent@0__:cuckoo.add', b'__keyevent@0__:cuckoo.insert']
+        multi = command.startswith('CF.INSERT')
+        args = (command, key, 'ITEMS', 'item') if multi else (command, key, 'item')
+
+        def read_events(pubsub):
+            # The pong fences notifications after the completed replicated write.
+            pubsub.ping(b'events-complete')
+            events = []
+            while True:
+                message = pubsub.get_message(timeout=5)
+                assert message is not None
+                if message['type'] == 'pong':
+                    assert message['data'] == b'events-complete'
+                    return events
+                assert message['type'] == 'message'
+                events.append((message['channel'], message['data']))
+
+        with self.client.pubsub() as primary_events, replica.pubsub() as replica_events:
+            for pubsub in (primary_events, replica_events):
+                pubsub.subscribe(*channels)
+                for _ in channels:
+                    assert pubsub.get_message(timeout=5)['type'] == 'subscribe'
+            for repeated in (False, True):
+                added = int(not (repeated and command.endswith('NX')))
+                assert self.client.execute_command(*args) == ([added] if multi else added)
+                self.waitForReplicaToSyncUp(self.replicas[0])
+                expected = [(channels[int(multi)], key.encode())] if added else []
+                assert read_events(primary_events) == expected
+                assert read_events(replica_events) == expected
+                assert self.client.dump(key) == replica.dump(key)
+
     def test_cf_del_replication(self):
         """Test that CF.DEL replicates to replica"""
         self.setup_replication(num_replicas=1)

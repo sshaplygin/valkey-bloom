@@ -7,7 +7,7 @@ use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 
 /// Used for decoding and encoding `CuckooObject`. Must match CUCKOO_TYPE_ENCODING_VERSION in data_type.rs.
-pub const CUCKOO_OBJECT_VERSION: u8 = 5;
+pub const CUCKOO_OBJECT_VERSION: u8 = 1;
 
 /// KeySpace Notification Events
 pub const ADD_EVENT: &str = "cuckoo.add";
@@ -139,8 +139,7 @@ impl CuckooObject {
         if expansion > configs::CUCKOO_EXPANSION_MAX {
             return Err(CuckooError::BadExpansion);
         }
-        if validate_size_limit && !CuckooObject::validate_size_before_create(capacity, bucket_size)
-        {
+        if !CuckooObject::validate_size_before_create(capacity, bucket_size, validate_size_limit) {
             return Err(CuckooError::ExceedsMaxSize);
         }
 
@@ -265,14 +264,14 @@ impl CuckooObject {
             .checked_mul(self.expansion.into())
             .filter(|n| *n <= configs::CUCKOO_CAPACITY_MAX)
             .ok_or(CuckooError::MaxScalingCapacity)?;
-        if validate_size_limit && !self.validate_size_before_scaling(capacity, self.bucket_size) {
+        if !self.validate_size_before_scaling(capacity, self.bucket_size, validate_size_limit) {
             return Err(CuckooError::ExceedsMaxSize);
         }
         Ok(capacity)
     }
 
-    /// Delete an item from the CuckooObject.
-    /// Iterates in reverse so newer (larger) filters are checked first, matching insertion order.
+    /// Remove the first matching fingerprint, searching subfilters from newest
+    /// to oldest.
     pub fn delete_item(&mut self, item: &[u8]) -> Result<i64, CuckooError> {
         let hash = ExternalFilter::hash_item(item);
         for filter in self.filters.iter_mut().rev() {
@@ -366,23 +365,32 @@ impl CuckooObject {
         &mut self.filters
     }
 
-    fn validate_size_before_create(capacity: i64, bucket_size: usize) -> bool {
-        let bytes = std::mem::size_of::<CuckooObject>()
-            + std::mem::size_of::<Box<CuckooFilter>>()
-            + CuckooFilter::compute_size(capacity, bucket_size);
-        CuckooObject::validate_size(bytes)
+    fn validate_size_before_create(
+        capacity: i64,
+        bucket_size: usize,
+        validate_size_limit: bool,
+    ) -> bool {
+        CuckooFilter::compute_size(capacity, bucket_size)
+            .checked_add(std::mem::size_of::<CuckooObject>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<Box<CuckooFilter>>()))
+            .is_some_and(|bytes| !validate_size_limit || Self::validate_size(bytes))
     }
 
-    fn validate_size_before_scaling(&self, new_capacity: i64, bucket_size: usize) -> bool {
+    fn validate_size_before_scaling(
+        &self,
+        new_capacity: i64,
+        bucket_size: usize,
+        validate_size_limit: bool,
+    ) -> bool {
         let vector_growth = if self.filters.len() == self.filters.capacity() {
             self.filters.capacity().max(4) * std::mem::size_of::<Box<CuckooFilter>>()
         } else {
             0
         };
-        let bytes = self.memory_usage()
-            + vector_growth
-            + CuckooFilter::compute_size(new_capacity, bucket_size);
-        CuckooObject::validate_size(bytes)
+        CuckooFilter::compute_size(new_capacity, bucket_size)
+            .checked_add(self.memory_usage())
+            .and_then(|n| n.checked_add(vector_growth))
+            .is_some_and(|bytes| !validate_size_limit || Self::validate_size(bytes))
     }
 
     pub fn validate_size(bytes: usize) -> bool {
@@ -396,7 +404,7 @@ impl CuckooObject {
             + self
                 .filters
                 .iter()
-                .map(|f| 6 * 8 + f.as_bytes().len())
+                .map(|f| 5 * 8 + f.as_bytes().len())
                 .sum::<usize>();
         let mut bytes = Vec::with_capacity(size);
         bytes.push(CUCKOO_OBJECT_VERSION);
@@ -472,7 +480,8 @@ impl CuckooObject {
         let mut size = Self::compute_size(vector_capacity);
         for _ in 0..count {
             let fields = header(&mut remaining)?;
-            let buckets = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
+            let checked = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
+            let buckets = checked.bucket_bytes();
             remaining = remaining
                 .get(buckets..)
                 .ok_or(CuckooError::DecodeFilterFailed)?;
@@ -490,14 +499,10 @@ impl CuckooObject {
         let mut filters = Vec::with_capacity(vector_capacity);
         for _ in 0..count {
             let fields = header(&mut bytes)?;
-            let size = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
+            let checked = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
+            let size = checked.bucket_bytes();
             let values = bytes.get(..size).ok_or(CuckooError::DecodeFilterFailed)?;
-            let filter = CuckooFilter::from_snapshot(
-                fields,
-                values.into(),
-                bucket_size as usize,
-                max_kicks as u32,
-            )?;
+            let filter = CuckooFilter::from_snapshot(checked, values.into(), max_kicks as u32)?;
             bytes = &bytes[size..];
             filters.push(Box::new(filter));
         }
@@ -561,6 +566,19 @@ pub struct CuckooFilter {
     bucket_size: usize,
 }
 
+/// Validated metadata; only the header validator can construct this value.
+pub struct ValidatedCuckooFilterHeader {
+    fields: [u64; 5],
+    bucket_size: usize,
+    bucket_bytes: usize,
+}
+
+impl ValidatedCuckooFilterHeader {
+    pub fn bucket_bytes(&self) -> usize {
+        self.bucket_bytes
+    }
+}
+
 impl CuckooFilter {
     pub fn new(capacity: i64, bucket_size: usize, max_kicks: u32) -> Self {
         let filter = ExternalFilter::with_config_and_rng(
@@ -579,52 +597,55 @@ impl CuckooFilter {
         result
     }
 
-    pub fn snapshot_header(&self) -> [u64; 6] {
+    pub fn snapshot_header(&self) -> [u64; 5] {
         let position = self.filter.rng().get_word_pos();
         [
             self.capacity as u64,
             self.filter.len() as u64,
             position as u64,
             (position >> 64) as u64,
-            0, // Reserved; must remain zero.
             self.as_bytes().len() as u64,
         ]
     }
 
     pub fn validate_snapshot_header(
-        fields: [u64; 6],
+        fields: [u64; 5],
         bucket_size: usize,
-    ) -> Result<usize, CuckooError> {
-        let [capacity, length, _, high, reserved, size] = fields;
+    ) -> Result<ValidatedCuckooFilterHeader, CuckooError> {
+        let [capacity, length, _, high, size] = fields;
         if !(configs::CUCKOO_CAPACITY_MIN as u64..=configs::CUCKOO_CAPACITY_MAX as u64)
             .contains(&capacity)
             || high >= 16
-            || reserved != 0
             || length > size
         {
             return Err(CuckooError::DecodeFilterFailed);
         }
         let size = usize::try_from(size).map_err(|_| CuckooError::DecodeFilterFailed)?;
+        let native_capacity =
+            usize::try_from(capacity).map_err(|_| CuckooError::DecodeFilterFailed)?;
         if size
-            != ExternalFilter::allocation_size(capacity as usize, bucket_size)
+            != ExternalFilter::allocation_size(native_capacity, bucket_size)
                 .map_err(|_| CuckooError::DecodeFilterFailed)?
         {
             return Err(CuckooError::DecodeFilterFailed);
         }
-        Ok(size)
+        Ok(ValidatedCuckooFilterHeader {
+            fields,
+            bucket_size,
+            bucket_bytes: size,
+        })
     }
 
     pub fn from_snapshot(
-        fields: [u64; 6],
+        header: ValidatedCuckooFilterHeader,
         values: Box<[u8]>,
-        bucket_size: usize,
         max_kicks: u32,
     ) -> Result<Self, CuckooError> {
-        let size = Self::validate_snapshot_header(fields, bucket_size)?;
-        if size != values.len() {
+        if header.bucket_bytes != values.len() {
             return Err(CuckooError::DecodeFilterFailed);
         }
-        let [capacity, length, low, high, _, _] = fields;
+        let [capacity, length, low, high, _] = header.fields;
+        let bucket_size = header.bucket_size;
         let mut rng = ChaCha8Rng::seed_from_u64(RNG_SEED);
         rng.set_word_pos(u128::from(low) | (u128::from(high) << 64));
         let filter = ExternalFilter::from_bytes_with_rng(
@@ -681,11 +702,10 @@ impl CuckooFilter {
             - std::mem::size_of::<ExternalFilter>()
     }
     pub fn compute_size(capacity: i64, bucket_size: usize) -> usize {
-        ExternalFilter::allocation_size(capacity as usize, bucket_size)
-            .and_then(|n| {
-                n.checked_add(std::mem::size_of::<Self>())
-                    .ok_or(cuckoofilter::CuckooError::InvalidConfiguration)
-            })
+        usize::try_from(capacity)
+            .ok()
+            .and_then(|n| ExternalFilter::allocation_size(n, bucket_size).ok())
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
             .unwrap_or(usize::MAX)
     }
     pub fn create_copy_from(from: &Self) -> Self {
@@ -906,9 +926,9 @@ mod tests {
             (41, 0),
             (49, 1),
             (65, 16),
-            (73, 2),
-            (81, 31),
-            (81, u64::MAX),
+            (73, 1),
+            (73, 31),
+            (73, u64::MAX),
         ] {
             let mut invalid = bytes.clone();
             invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -917,7 +937,7 @@ mod tests {
                 "offset {offset}"
             );
         }
-        for version in [1, 2, 3, 4, 255] {
+        for version in [0, 2, 3, 4, 5, 255] {
             let mut invalid = bytes.clone();
             invalid[0] = version;
             assert!(matches!(
@@ -1002,7 +1022,7 @@ mod tests {
         digest.write(&object.encode_object());
         assert_eq!(
             digest.finish(),
-            8_107_312_244_792_314_012,
+            12_499_279_960_782_828_056,
             "scaled placement fixture"
         );
     }
@@ -1143,6 +1163,41 @@ mod tests {
         assert_eq!(restored.num_deleted(), i64::MAX);
     }
 
+    #[test]
+    fn size_overflow_is_rejected_even_when_local_limits_are_bypassed() {
+        let object = CuckooObject::new_reserved(32, 4, 20, 2, false).unwrap();
+        // Force the allocation-size sentinel without attempting a large allocation.
+        for (capacity, bucket_size) in [(32, 0), (i64::MAX, 1), (-1, 4)] {
+            assert_eq!(
+                CuckooFilter::compute_size(capacity, bucket_size),
+                usize::MAX
+            );
+            for validate_limit in [false, true] {
+                assert!(!CuckooObject::validate_size_before_create(
+                    capacity,
+                    bucket_size,
+                    validate_limit
+                ));
+                assert!(!object.validate_size_before_scaling(
+                    capacity,
+                    bucket_size,
+                    validate_limit
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn validated_header_still_rejects_mismatched_bucket_storage() {
+        for values in [vec![100; 31], vec![100; 33], vec![7; 32]] {
+            let header = CuckooFilter::validate_snapshot_header([32, 0, 0, 0, 32], 4).unwrap();
+            assert!(matches!(
+                CuckooFilter::from_snapshot(header, values.into_boxed_slice(), 20),
+                Err(CuckooError::DecodeFilterFailed)
+            ));
+        }
+    }
+
     // All tests that change the global Cuckoo memory limit belong here. Other
     // unit tests bypass this limit; the guard restores it even on assertion failure.
     #[test]
@@ -1243,9 +1298,8 @@ mod tests {
         for _ in 0..CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX - 1 {
             filters.push(Box::new(
                 CuckooFilter::from_snapshot(
-                    [64, 64, 0, 0, 0, 64],
+                    CuckooFilter::validate_snapshot_header([64, 64, 0, 0, 64], 4).unwrap(),
                     vec![7; 64].into_boxed_slice(),
-                    4,
                     1,
                 )
                 .unwrap(),

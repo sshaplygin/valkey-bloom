@@ -7,10 +7,10 @@ from cuckoo_test_utils import CuckooTestCase
 
 
 def snapshot(filters, bucket_size=1, expansion=1):
-    data = bytes([5]) + struct.pack('<5Q', expansion, bucket_size, 20, len(filters), 0)
-    for capacity, reserved, buckets in filters:
+    data = bytes([1]) + struct.pack('<5Q', expansion, bucket_size, 20, len(filters), 0)
+    for capacity, buckets in filters:
         occupied = sum(value != 100 for value in buckets)
-        data += struct.pack('<6Q', capacity, occupied, 0, 0, reserved, len(buckets)) + buckets
+        data += struct.pack('<5Q', capacity, occupied, 0, 0, len(buckets)) + buckets
     return data
 
 
@@ -30,7 +30,7 @@ class TestCuckooBoundaries(CuckooTestCase):
         ('ADD', ['item']), ('ADDNX', ['item']), ('DEL', ['item']),
         ('COUNT', ['item']), ('EXISTS', ['item']), ('MEXISTS', ['item']),
         ('INFO', []), ('RESERVE', [64]), ('INSERT', ['ITEMS', 'item']),
-        ('INSERTNX', ['ITEMS', 'item']), ('LOAD', [snapshot([(1, 0, b'd')])]),
+        ('INSERTNX', ['ITEMS', 'item']), ('LOAD', [snapshot([(1, b'd')])]),
     ])
     def test_wrongtype(self, command, args):
         client = self.server.get_new_client()
@@ -136,9 +136,9 @@ class TestCuckooBoundaries(CuckooTestCase):
         assert not client.exists('filter')
 
     @pytest.mark.parametrize('data,error', [
-        (snapshot([(131073, 0, bytes([7]) * (1024 * 255))], bucket_size=255, expansion=32768),
+        (snapshot([(131073, bytes([7]) * (1024 * 255))], bucket_size=255, expansion=32768),
          'cuckoo object reached max capacity'),
-        (snapshot([(1, 0, b'\x07') for _ in range(1024)]),
+        (snapshot([(1, b'\x07') for _ in range(1024)]),
          'cuckoo object reached max number of filters'),
     ], ids=['capacity-overflow', 'filter-count-limit'])
     def test_scaling_limits_preserve_state(self, data, error):
@@ -153,12 +153,12 @@ class TestCuckooBoundaries(CuckooTestCase):
 
     def test_delete_reopens_old_filter_before_scaling(self):
         client = self.server.get_new_client()
-        client.execute_command('CF.LOAD', 'probe', snapshot([(1, 0, b'\x07')]))
+        client.execute_command('CF.LOAD', 'probe', snapshot([(1, b'\x07')]))
         candidates = [f'item{i}' for i in range(4096)]
         matches = client.execute_command('CF.MEXISTS', 'probe', *candidates)
         item = candidates[matches.index(1)]
         client.delete('probe')
-        client.execute_command('CF.LOAD', 'filter', snapshot([(1, 0, b'\x07'), (1, 0, b'\x08')]))
+        client.execute_command('CF.LOAD', 'filter', snapshot([(1, b'\x07'), (1, b'\x08')]))
         assert client.execute_command('CF.DEL', 'filter', item) == 1
         assert client.execute_command('CF.ADD', 'filter', item) == 1
         assert client.execute_command('CF.INFO', 'filter', 'Number of filters') == 2

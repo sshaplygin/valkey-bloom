@@ -7,9 +7,9 @@ from cuckoo_test_utils import CuckooTestCase
 
 
 def empty_snapshot(capacities):
-    snapshot = bytes([5]) + struct.pack('<5Q', 2, 4, 20, len(capacities), 0)
+    snapshot = bytes([1]) + struct.pack('<5Q', 2, 4, 20, len(capacities), 0)
     for capacity in capacities:
-        snapshot += struct.pack('<6Q', capacity, 0, 0, 0, 0, capacity) + bytes([100]) * capacity
+        snapshot += struct.pack('<5Q', capacity, 0, 0, 0, capacity) + bytes([100]) * capacity
     return snapshot
 
 
@@ -65,15 +65,15 @@ class TestCuckooSnapshotValidation(CuckooTestCase):
         client.delete('template')
         chunk = rdb_bucket_chunk(bytes([100]) * 1048576)
         header = rdb_unsigned_fields(2, 4, 20, 1, 0)
-        large = rdb_unsigned_fields(16777216, 0, 0, 0, 0, 16777216)
-        small = rdb_unsigned_fields(32, 0, 0, 0, 0, 32)
+        large = rdb_unsigned_fields(16777216, 0, 0, 0, 16777216)
+        small = rdb_unsigned_fields(32, 0, 0, 0, 32)
         valid_filter = small + rdb_bucket_chunk(bytes([100]) * 32)
         invalid = [
             header + large,  # Missing first chunk.
             header + large + chunk * 2,  # Missing a later chunk.
             header + large + rdb_bucket_chunk(b'x'),
             header + large + rdb_bucket_chunk(bytes(1048577)),
-            header + rdb_unsigned_fields(2**64 - 1, 0, 0, 0, 0, 2**64 - 1),
+            header + rdb_unsigned_fields(2**64 - 1, 0, 0, 0, 2**64 - 1),
             header + small + rdb_bucket_chunk(bytes(32)),  # Occupancy disagrees with count.
             rdb_unsigned_fields(2, 4, 20, 2, 0) + valid_filter + large,
         ]
@@ -133,10 +133,10 @@ class TestCuckooSnapshotValidation(CuckooTestCase):
         client = self.server.get_new_client()
         snapshot = empty_snapshot([32])
         invalid = [snapshot[:end] for end in range(len(snapshot))]
-        invalid += [bytes([version]) + snapshot[1:] for version in [1, 2, 3, 4, 255]]
+        invalid += [bytes([version]) + snapshot[1:] for version in [0, 2, 3, 4, 5, 255]]
         invalid += [snapshot + b'extra']
         for offset, value in [(25, 1025), (33, 2**63), (41, 2**64 - 1),
-                              (49, 1), (65, 16), (73, 1), (73, 2), (81, 2**64 - 1)]:
+                              (49, 1), (65, 16), (73, 1), (73, 31), (73, 2**64 - 1)]:
             invalid.append(snapshot[:offset] + struct.pack('<Q', value) + snapshot[offset + 8:])
         metrics = client.info('modules')
         for data in invalid:
@@ -148,16 +148,23 @@ class TestCuckooSnapshotValidation(CuckooTestCase):
             if name.startswith('bf_cuckoo_') and 'defrag' not in name:
                 assert after[name] == value, name
 
-    def test_restore_rejects_previous_placement_version(self):
-        import base64
-
-        # Captured with Valkey 8.0.11 and module format 4 after:
-        # CF.RESERVE v4 64; CF.ADD v4 item. Keep this old RDB payload unchanged.
-        dump = base64.b64decode(
-            'B4Fy5ySih+W0BAIBAgQCFAIBAgACQEACAQIAAgACAAJAQAXDEEBAAWRk4BEAAOvgERqgAAFkZAALABwex7hevJp3'
-        )
+    @pytest.mark.parametrize('version', [0, 2, 3, 4, 5, 255])
+    def test_restore_rejects_unsupported_format(self, version):
         client = self.server.get_new_client()
-        with pytest.raises(ResponseError):
-            client.restore('v4', 0, dump)
-        assert not client.exists('v4')
-        assert client.ping()
+        client.execute_command('CF.RESERVE', 'source', 32)
+        dump = client.dump('source')
+        assert dump[:2] == b'\x07\x81'
+        type_id = int.from_bytes(dump[2:10], 'big')
+        assert type_id & 1023 == 1
+        invalid_id = (type_id & ~1023) | version
+        invalid = dump[:2] + invalid_id.to_bytes(8, 'big') + dump[10:]
+        client.execute_command('DEBUG', 'SET-SKIP-CHECKSUM-VALIDATION', 1)
+        try:
+            # Positive control ensures the unmodified framing can be restored.
+            client.restore('control', 0, dump)
+            with pytest.raises(ResponseError):
+                client.restore('invalid', 0, invalid)
+            assert not client.exists('invalid')
+            assert client.ping()
+        finally:
+            client.execute_command('DEBUG', 'SET-SKIP-CHECKSUM-VALIDATION', 0)

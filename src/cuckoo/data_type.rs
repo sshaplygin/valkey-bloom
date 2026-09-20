@@ -99,12 +99,12 @@ impl ValkeyDataType for CuckooObject {
         CuckooObject::validate_snapshot_header(header).ok()?;
         let mut filters = Vec::with_capacity(1);
         for _ in 0..count {
-            let header = load_header(rdb)?;
-            let size = CuckooFilter::validate_snapshot_header(header, bucket_size as usize).ok()?;
-            let values = load_bucket_chunks(size, || raw::load_string_buffer(rdb).ok())?;
-            let filter =
-                CuckooFilter::from_snapshot(header, values, bucket_size as usize, max_kicks as u32)
+            let header =
+                CuckooFilter::validate_snapshot_header(load_header(rdb)?, bucket_size as usize)
                     .ok()?;
+            let values =
+                load_bucket_chunks(header.bucket_bytes(), || raw::load_string_buffer(rdb).ok())?;
+            let filter = CuckooFilter::from_snapshot(header, values, max_kicks as u32).ok()?;
             filters.push(Box::new(filter));
         }
         let object = Self::from_existing(

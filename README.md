@@ -6,7 +6,7 @@ Valkey-Bloom is built using `bloomfilter::Bloom` (https://crates.io/crates/bloom
 
 It is API compatible with the bloom filter command syntax of the official Valkey client libraries including valkey-py, valkey-java, valkey-go (as well as the equivalent Redis libraries)
 
-The module also supports Cuckoo filters, space-efficient probabilistic data structures with commands similar to Bloom filters for insertion, membership checks, reservation, and inspection. Cuckoo filters additionally support deletion and duplicate insertion; counts and membership checks are approximate because fingerprints can collide.
+Cuckoo filters also support deletion and duplicate insertion. Membership and counts are approximate because fingerprints can collide.
 
 ## Supported commands
 
@@ -40,7 +40,7 @@ CF.INSERTNX
 CF.LOAD
 ```
 
-See [Cuckoo commands and persistence](docs/cuckoo.md) for CF.INFO fields, deletion semantics and persistence compatibility.
+See [Cuckoo filters](docs/cuckoo.md) for behavior, limits and persistence.
 
 ## Build instructions
 ```
