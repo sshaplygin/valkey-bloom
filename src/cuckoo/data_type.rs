@@ -5,6 +5,43 @@ use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::{logging, raw};
 
+// Maximum bucket bytes per RDB string buffer.
+const RDB_BUCKET_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Grow only after reading and checking a chunk, never from an untrusted header alone.
+/// Grow geometrically up to half the final size, then reserve the final buffer.
+/// This bounds simultaneous old/new allocations even for non-power-of-two sizes
+/// and avoids reallocating on conversion to Box. LoadStringBuffer itself
+/// allocates on the server before this helper can check the returned length.
+fn load_bucket_chunks<B: AsRef<[u8]>>(
+    size: usize,
+    mut load_chunk: impl FnMut() -> Option<B>,
+) -> Option<Box<[u8]>> {
+    if size == 0 || size > isize::MAX as usize {
+        return None;
+    }
+    let mut values = Vec::new();
+    while values.len() < size {
+        let expected = RDB_BUCKET_CHUNK_SIZE.min(size - values.len());
+        let data = load_chunk()?;
+        let bytes = data.as_ref();
+        if bytes.len() != expected {
+            return None;
+        }
+        let required = values.len().checked_add(expected)?;
+        if required > values.capacity() {
+            let capacity = if required > size / 2 {
+                size
+            } else {
+                (size / 2).min(values.capacity().checked_mul(2)?.max(required))
+            };
+            values.try_reserve_exact(capacity - values.len()).ok()?;
+        }
+        values.extend_from_slice(bytes);
+    }
+    Some(values.into_boxed_slice())
+}
+
 const CUCKOO_TYPE_ENCODING_VERSION: i32 = CUCKOO_OBJECT_VERSION as i32;
 
 pub static CUCKOO_TYPE: ValkeyType = ValkeyType::new(
@@ -58,23 +95,16 @@ impl ValkeyDataType for CuckooObject {
             }
             Some(fields)
         }
-        let header @ [expansion, bucket_size, max_kicks, count] = load_header(rdb)?;
+        let header @ [expansion, bucket_size, max_kicks, count, num_deleted] = load_header(rdb)?;
         CuckooObject::validate_snapshot_header(header).ok()?;
         let mut filters = Vec::with_capacity(1);
         for _ in 0..count {
             let header = load_header(rdb)?;
             let size = CuckooFilter::validate_snapshot_header(header, bucket_size as usize).ok()?;
-            let data = raw::load_string_buffer(rdb).ok()?;
-            if data.as_ref().len() != size {
-                return None;
-            }
-            let filter = CuckooFilter::from_snapshot(
-                header,
-                data.as_ref().into(),
-                bucket_size as usize,
-                max_kicks as u32,
-            )
-            .ok()?;
+            let values = load_bucket_chunks(size, || raw::load_string_buffer(rdb).ok())?;
+            let filter =
+                CuckooFilter::from_snapshot(header, values, bucket_size as usize, max_kicks as u32)
+                    .ok()?;
             filters.push(Box::new(filter));
         }
         let object = Self::from_existing(
@@ -82,6 +112,7 @@ impl ValkeyDataType for CuckooObject {
             bucket_size as usize,
             max_kicks as u32,
             filters,
+            num_deleted,
         );
         if !Self::validate_size(object.memory_usage()) {
             logging::log_warning(format!(
@@ -120,11 +151,115 @@ pub unsafe fn rdb_save_cuckoo_object(rdb: *mut raw::RedisModuleIO, value: &Cucko
         for field in filter.snapshot_header() {
             raw::RedisModule_SaveUnsigned.unwrap()(rdb, field);
         }
-        let bytes = filter.as_bytes();
-        raw::RedisModule_SaveStringBuffer.unwrap()(rdb, bytes.as_ptr().cast(), bytes.len());
+        for chunk in filter.as_bytes().chunks(RDB_BUCKET_CHUNK_SIZE) {
+            raw::RedisModule_SaveStringBuffer.unwrap()(rdb, chunk.as_ptr().cast(), chunk.len());
+        }
     }
 }
 
 pub fn cuckoo_rdb_aux_load(_rdb: *mut raw::RedisModuleIO) -> c_int {
     raw::Status::Ok as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_bucket_chunks, RDB_BUCKET_CHUNK_SIZE as CHUNK};
+    use crate::test_allocator::{largest_allocation, measure_allocations};
+
+    #[test]
+    fn missing_first_chunk_does_not_allocate_declared_size() {
+        let (result, largest) =
+            largest_allocation(|| load_bucket_chunks::<&[u8]>(16 * CHUNK, || None));
+        assert!(result.is_none());
+        assert_eq!(largest, 0);
+    }
+
+    #[test]
+    fn truncated_stream_only_allocates_for_received_chunks() {
+        let chunk = vec![100; CHUNK];
+        for received in [1_usize, 2, 3, 5] {
+            let mut calls = 0;
+            let (result, largest) = largest_allocation(|| {
+                load_bucket_chunks(16 * CHUNK, || {
+                    calls += 1;
+                    (calls <= received).then_some(chunk.as_slice())
+                })
+            });
+            assert!(result.is_none());
+            assert_eq!(calls, received + 1);
+            assert_eq!(largest, received.next_power_of_two() * CHUNK);
+        }
+    }
+
+    #[test]
+    fn intermediate_capacity_is_bounded_for_non_power_of_two_sizes() {
+        let chunk = vec![100; CHUNK];
+        for (size, received) in [(7 * CHUNK, 3), (13 * CHUNK, 5)] {
+            let mut calls = 0;
+            let (result, stats) = measure_allocations(|| {
+                load_bucket_chunks(size, || {
+                    calls += 1;
+                    (calls <= received).then_some(chunk.as_slice())
+                })
+            });
+            assert!(result.is_none());
+            // A plain doubling strategy would reserve 4 / 8 MiB here, making
+            // the subsequent final allocation coexist with more than size/2.
+            assert_eq!(stats.largest_allocation, size / 2);
+            assert!(stats.peak_live_bytes <= size + size / 2);
+            assert_eq!(stats.live_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn wrong_chunk_lengths_are_rejected_before_growing() {
+        let full = vec![100; CHUNK];
+        let oversized = vec![100; CHUNK + 1];
+        for (size, bad, expected_allocation) in [
+            (16 * CHUNK, &[][..], CHUNK),
+            (16 * CHUNK, &full[..CHUNK - 1], CHUNK),
+            (16 * CHUNK, oversized.as_slice(), CHUNK),
+            (CHUNK + 3, full.as_slice(), CHUNK + 3),
+        ] {
+            let mut calls = 0;
+            let (result, largest) = largest_allocation(|| {
+                load_bucket_chunks(size, || {
+                    calls += 1;
+                    Some(if calls == 1 { full.as_slice() } else { bad })
+                })
+            });
+            assert!(result.is_none());
+            assert_eq!(largest, expected_allocation);
+        }
+        let (result, largest) =
+            largest_allocation(|| load_bucket_chunks(16 * CHUNK, || Some(&[0])));
+        assert!(result.is_none());
+        assert_eq!(largest, 0);
+    }
+
+    #[test]
+    fn chunks_preserve_contents_and_partial_tail() {
+        for size in [1, CHUNK, CHUNK + 3, 3 * CHUNK, 5 * CHUNK + 7] {
+            let input: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            let mut chunks = input.chunks(CHUNK);
+            let (result, stats) =
+                measure_allocations(|| load_bucket_chunks(size, || chunks.next()));
+            assert_eq!(result.unwrap().as_ref(), input);
+            assert_eq!(stats.largest_allocation, size);
+            assert!(stats.peak_live_bytes <= size + size / 2);
+            assert_eq!(stats.live_bytes, size);
+            assert!(chunks.next().is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_allocation_sizes_do_not_read_or_allocate() {
+        for size in [0, isize::MAX as usize + 1, usize::MAX] {
+            let (result, largest) = largest_allocation(|| {
+                load_bucket_chunks::<&[u8]>(size, || panic!("invalid size must not read input"))
+            });
+            assert!(result.is_none());
+            assert_eq!(largest, 0);
+        }
+    }
 }

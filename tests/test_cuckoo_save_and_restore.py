@@ -1,11 +1,11 @@
 import os
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 from valkey_test_case import ValkeyServerHandle
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import *
 
-class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
+class TestCuckooSaveRestore(CuckooTestCase):
 
     def test_basic_save_and_restore(self):
         """Test basic RDB save and restore of cuckoo filter"""
@@ -112,6 +112,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         client.execute_command('CF.DEL', 'delTest', 'remove1')
         client.execute_command('CF.DEL', 'delTest', 'remove2')
 
+        assert client.execute_command('CF.INFO', 'delTest', 'Number of items deleted') == 2
         # Verify before save
         assert client.execute_command('CF.EXISTS', 'delTest', 'keep1') == 1
         assert client.execute_command('CF.EXISTS', 'delTest', 'remove1') == 0
@@ -125,6 +126,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
 
         # Verify deletions persisted
+        assert client.execute_command('CF.INFO', 'delTest', 'Number of items deleted') == 2
         assert client.execute_command('CF.EXISTS', 'delTest', 'keep1') == 1
         assert client.execute_command('CF.EXISTS', 'delTest', 'keep2') == 1
         assert client.execute_command('CF.EXISTS', 'delTest', 'remove1') == 0
@@ -204,7 +206,7 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
 
     def test_rdb_load_ignores_local_memory_limit(self):
         client = self.server.get_new_client()
-        client.execute_command('CF.RESERVE', 'large', 100000)
+        client.execute_command('CF.RESERVE', 'large', 1000000, 'BUCKETSIZE', 5)
         client.execute_command('CF.ADD', 'large', 'saved')
         before = client.dump('large')
         client.save()
@@ -214,3 +216,45 @@ class TestCuckooSaveRestore(ValkeyBloomTestCaseBase):
         self.server.args['bf.cuckoo-memory-usage-limit'] = '1024'
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.get_new_client().dump('large') == before
+
+    def test_rdb_bucket_chunks_include_partial_last_chunk(self):
+        client = self.server.get_new_client()
+        # 1,310,720 bucket bytes: one full 1 MiB chunk and a partial chunk.
+        client.execute_command('CF.RESERVE', 'chunked', 1000000, 'BUCKETSIZE', 5)
+        items = [f'chunk-item-{i}' for i in range(1000)]
+        client.execute_command('CF.INSERT', 'chunked', 'ITEMS', *items)
+        before = client.dump('chunked')
+        digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'chunked')
+        client.save()
+        self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
+        wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
+        assert client.dump('chunked') == before
+        assert client.execute_command('DEBUG', 'DIGEST-VALUE', 'chunked') == digest
+        assert client.execute_command('CF.MEXISTS', 'chunked', *items) == [1] * len(items)
+
+    def test_eviction_sequence_continues_after_restart(self):
+        from cuckoo_test_utils import rewrite_cuckoo_aof
+
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'saved', 64, 'BUCKETSIZE', 2, 'EXPANSION', 2)
+        for i in range(40):
+            assert client.execute_command('CF.ADD', 'saved', f'initial{i}') == 1
+        assert client.copy('saved', 'reference')
+        items = [f'continued{i}' for i in range(200)]
+        expected = []
+        for item in items:
+            assert client.execute_command('CF.ADD', 'reference', item) == 1
+            expected.append(client.dump('reference'))
+        snapshots = rewrite_cuckoo_aof(client, self.server)
+        # The first filter's RNG state changed: this sequence exercised eviction.
+        assert snapshots[b'saved'][57:73] != snapshots[b'reference'][57:73]
+        client.delete('reference')
+        client.config_set('appendonly', 'no')
+        self.server.args['appendonly'] = 'no'
+        client.bgsave()
+        self.server.wait_for_save_done()
+        self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
+        wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
+        for item, dump in zip(items, expected):
+            assert client.execute_command('CF.ADD', 'saved', item) == 1
+            assert client.dump('saved') == dump

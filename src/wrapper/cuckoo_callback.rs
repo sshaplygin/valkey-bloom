@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use valkey_module::defrag::Defrag;
 use valkey_module::digest::Digest;
 use valkey_module::logging;
-use valkey_module::logging::{log_io_error, ValkeyLogLevel};
 use valkey_module::raw;
 use valkey_module::{RedisModuleDefragCtx, RedisModuleString};
 
@@ -46,13 +45,7 @@ pub unsafe extern "C" fn cuckoo_aof_rewrite(
     value: *mut c_void,
 ) {
     let cuckoo_obj = &*value.cast::<CuckooObject>();
-    let hex = match cuckoo_obj.encode_object() {
-        Ok(val) => val,
-        Err(err) => {
-            log_io_error(aof, ValkeyLogLevel::Warning, err.as_str());
-            return;
-        }
-    };
+    let hex = cuckoo_obj.encode_object();
     let cmd = CString::new("CF.LOAD").unwrap();
     let fmt = CString::new("sb").unwrap();
     valkey_module::raw::RedisModule_EmitAOF.unwrap()(
@@ -142,23 +135,26 @@ pub unsafe extern "C" fn cuckoo_defrag(
 
     // While we are within a timeframe decided from should_stop_defrag and not over the number of filters defrag the next filter
     while !defrag.should_stop_defrag() && cursor < num_filters {
-        // Get mutable access to filters and remove the current filter
-        let filters = cuckoo_object.filters_mut();
-        let cuckoo_filter_box = filters.remove(cursor as usize);
-        let cuckoo_filter = Box::into_raw(cuckoo_filter_box);
-        let defrag_result = defrag.alloc(cuckoo_filter as *mut c_void);
-
-        let mut defragged_filter = {
-            if !defrag_result.is_null() {
-                metrics::CUCKOO_DEFRAG_HITS.fetch_add(1, Ordering::Relaxed);
-                Box::from_raw(defrag_result as *mut crate::cuckoo::utils::CuckooFilter)
-            } else {
-                metrics::CUCKOO_DEFRAG_MISSES.fetch_add(1, Ordering::Relaxed);
-                Box::from_raw(cuckoo_filter)
-            }
+        // Resolve the API before taking ownership out of the slot. Between read
+        // and write there is only a non-unwinding C call and pointer handling.
+        let defrag_alloc = raw::RedisModule_DefragAlloc.unwrap();
+        let slot = &mut cuckoo_object.filters_mut()[cursor as usize];
+        let original = Box::into_raw(std::ptr::read(slot));
+        let moved = defrag_alloc(defrag_ctx, original.cast());
+        let relocated = if moved.is_null() {
+            original
+        } else {
+            moved.cast()
         };
+        std::ptr::write(slot, Box::from_raw(relocated));
+        if moved.is_null() {
+            metrics::CUCKOO_DEFRAG_MISSES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics::CUCKOO_DEFRAG_HITS.fetch_add(1, Ordering::Relaxed);
+        }
 
-        defragged_filter.realloc_buckets(|buckets| {
+        slot.realloc_buckets(|buckets| {
+            metrics::CUCKOO_DEFRAG_BUCKET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
             let len = buckets.len();
             let ptr = Box::into_raw(buckets).cast::<u8>();
             let moved = defrag.alloc(ptr.cast());
@@ -172,10 +168,6 @@ pub unsafe extern "C" fn cuckoo_defrag(
             Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))
         });
 
-        // Reinsert the defragmented filter and increment the cursor
-        cuckoo_object
-            .filters_mut()
-            .insert(cursor as usize, defragged_filter);
         cursor += 1;
     }
 
@@ -231,3 +223,7 @@ pub unsafe extern "C" fn cuckoo_defrag(
     // Return 0 to indicate successful complete defragmentation
     0
 }
+
+#[cfg(test)]
+#[path = "cuckoo_defrag_tests.rs"]
+mod tests;

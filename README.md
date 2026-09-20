@@ -40,6 +40,8 @@ CF.INSERTNX
 CF.LOAD
 ```
 
+See [Cuckoo commands and persistence](docs/cuckoo.md) for CF.INFO fields, deletion semantics and persistence compatibility.
+
 ## Build instructions
 ```
 curl https://sh.rustup.rs -sSf | sh

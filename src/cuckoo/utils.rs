@@ -7,7 +7,7 @@ use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 
 /// Used for decoding and encoding `CuckooObject`. Must match CUCKOO_TYPE_ENCODING_VERSION in data_type.rs.
-pub const CUCKOO_OBJECT_VERSION: u8 = 3;
+pub const CUCKOO_OBJECT_VERSION: u8 = 5;
 
 /// KeySpace Notification Events
 pub const ADD_EVENT: &str = "cuckoo.add";
@@ -18,19 +18,15 @@ pub const INSERT_EVENT: &str = "cuckoo.insert";
 pub const LOAD_EVENT: &str = "cuckoo.load";
 
 /// Client Errors
-pub const ERROR: &str = "ERROR";
 pub const FILTER_FULL: &str = "ERR cuckoo filter is full";
 pub const NON_SCALING_FILTER_FULL: &str = "ERR non scaling cuckoo filter is full";
 pub const NOT_FOUND: &str = "ERR not found";
 pub const ITEM_EXISTS: &str = "ERR item exists";
-pub const INVALID_INFO_VALUE: &str = "ERR invalid information value";
 pub const BAD_EXPANSION: &str = "ERR bad expansion";
 pub const BAD_CAPACITY: &str = "ERR bad capacity";
 pub const BAD_BUCKET_SIZE: &str = "ERR bad bucket size";
 pub const BAD_MAX_KICKS: &str = "ERR bad max kicks";
 pub const BAD_MAX_ITERATIONS: &str = "ERR bad max iterations";
-pub const BUCKET_SIZE_RANGE: &str = "ERR (bucket size must be between 1 and 255)";
-pub const CAPACITY_LARGER_THAN_0: &str = "ERR (capacity should be larger than 0)";
 pub const CAPACITY_OUT_OF_RANGE: &str = "ERR capacity must be between min and max";
 pub const CAPACITY_MUST_BE_LARGER_THAN_ZERO: &str = "ERR capacity must be larger than 0";
 pub const BUCKET_SIZE_OUT_OF_RANGE: &str = "ERR bucket size must be between min and max";
@@ -41,19 +37,14 @@ pub const MAX_ITERATIONS_ARG_REQUIRED: &str = "ERR MAXITERATIONS requires an arg
 pub const EXPANSION_ARG_REQUIRED: &str = "ERR EXPANSION requires an argument";
 pub const ITEMS_KEYWORD_REQUIRED: &str = "ERR ITEMS keyword required";
 pub const UNKNOWN_OPTION_OR_MISSING_ITEMS: &str = "ERR unknown option or missing ITEMS keyword";
-pub const UNKNOWN_ARGUMENT: &str = "ERR unknown argument received";
 pub const UNKNOWN_OPTION: &str = "ERR unknown option";
 pub const EXCEEDS_MAX_CUCKOO_SIZE: &str = "ERR operation exceeds cuckoo object memory limit";
 pub const MAX_NUM_SCALING_FILTERS: &str = "ERR cuckoo object reached max number of filters";
-pub const KEY_EXISTS: &str = "BUSYKEY Target key name already exists.";
 pub const DECODE_CUCKOO_OBJECT_FAILED: &str = "ERR cuckoo object decoding failed";
 pub const DECODE_UNSUPPORTED_VERSION: &str =
     "ERR cuckoo object decoding failed. Unsupported version";
 pub const NO_ITEMS_SPECIFIED: &str = "ERR no items specified";
 pub const FAILED_TO_SET_FILTER: &str = "ERR failed to set cuckoo filter";
-
-/// Logging Error messages
-pub const ENCODE_CUCKOO_OBJECT_FAILED: &str = "Failed to encode cuckoo object.";
 
 /// Max number of filters allowed within a cuckoo object.
 pub const CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX: i32 = 1024;
@@ -64,17 +55,13 @@ pub const MAX_BUCKET_SIZE: usize = 255;
 #[derive(Debug, PartialEq)]
 pub enum CuckooError {
     FilterFull,
-    NotFound,
     ExceedsMaxSize,
-    InvalidParameter,
-    SerializationError,
     MaxNumScalingFilters,
     BadCapacity,
     BadBucketSize,
     BadMaxKicks,
     BadExpansion,
     NonScalingFilterFull,
-    EncodeFilterFailed,
     DecodeFilterFailed,
     DecodeUnsupportedVersion,
 }
@@ -83,20 +70,44 @@ impl CuckooError {
     pub fn as_str(&self) -> &'static str {
         match self {
             CuckooError::FilterFull => FILTER_FULL,
-            CuckooError::NotFound => NOT_FOUND,
             CuckooError::ExceedsMaxSize => EXCEEDS_MAX_CUCKOO_SIZE,
-            CuckooError::InvalidParameter => ERROR,
-            CuckooError::SerializationError => ENCODE_CUCKOO_OBJECT_FAILED,
             CuckooError::MaxNumScalingFilters => MAX_NUM_SCALING_FILTERS,
             CuckooError::BadCapacity => BAD_CAPACITY,
             CuckooError::BadBucketSize => BAD_BUCKET_SIZE,
             CuckooError::BadMaxKicks => BAD_MAX_KICKS,
             CuckooError::BadExpansion => BAD_EXPANSION,
             CuckooError::NonScalingFilterFull => NON_SCALING_FILTER_FULL,
-            CuckooError::EncodeFilterFailed => ENCODE_CUCKOO_OBJECT_FAILED,
             CuckooError::DecodeFilterFailed => DECODE_CUCKOO_OBJECT_FAILED,
             CuckooError::DecodeUnsupportedVersion => DECODE_UNSUPPORTED_VERSION,
         }
+    }
+}
+
+/// Shared range checks; command handlers map these errors to their public
+/// argument-specific messages, while constructors preserve their own contract.
+pub fn validate_capacity(capacity: i64) -> Result<(), CuckooError> {
+    if (configs::CUCKOO_CAPACITY_MIN..=configs::CUCKOO_CAPACITY_MAX).contains(&capacity) {
+        Ok(())
+    } else {
+        Err(CuckooError::BadCapacity)
+    }
+}
+
+pub fn validate_bucket_size(bucket_size: usize) -> Result<(), CuckooError> {
+    if (MIN_BUCKET_SIZE..=MAX_BUCKET_SIZE).contains(&bucket_size) {
+        Ok(())
+    } else {
+        Err(CuckooError::BadBucketSize)
+    }
+}
+
+pub fn validate_max_kicks(max_kicks: u32) -> Result<(), CuckooError> {
+    if (configs::CUCKOO_MAX_KICKS_MIN as u32..=configs::CUCKOO_MAX_KICKS_MAX as u32)
+        .contains(&max_kicks)
+    {
+        Ok(())
+    } else {
+        Err(CuckooError::BadMaxKicks)
     }
 }
 
@@ -107,6 +118,7 @@ pub struct CuckooObject {
     bucket_size: usize,
     max_kicks: u32,
     filters: Vec<Box<CuckooFilter>>,
+    num_deleted: u64,
 }
 
 impl CuckooObject {
@@ -118,17 +130,9 @@ impl CuckooObject {
         expansion: u32,
         validate_size_limit: bool,
     ) -> Result<CuckooObject, CuckooError> {
-        if !(configs::CUCKOO_CAPACITY_MIN..=configs::CUCKOO_CAPACITY_MAX).contains(&capacity) {
-            return Err(CuckooError::BadCapacity);
-        }
-        if !(MIN_BUCKET_SIZE..=MAX_BUCKET_SIZE).contains(&bucket_size) {
-            return Err(CuckooError::BadBucketSize);
-        }
-        if !(configs::CUCKOO_MAX_KICKS_MIN as u32..=configs::CUCKOO_MAX_KICKS_MAX as u32)
-            .contains(&max_kicks)
-        {
-            return Err(CuckooError::BadMaxKicks);
-        }
+        validate_capacity(capacity)?;
+        validate_bucket_size(bucket_size)?;
+        validate_max_kicks(max_kicks)?;
         if expansion > configs::CUCKOO_EXPANSION_MAX {
             return Err(CuckooError::BadExpansion);
         }
@@ -145,6 +149,7 @@ impl CuckooObject {
             bucket_size,
             max_kicks,
             filters,
+            num_deleted: 0,
         };
 
         cuckoo.cuckoo_object_incr_metrics_on_new_create();
@@ -157,12 +162,14 @@ impl CuckooObject {
         bucket_size: usize,
         max_kicks: u32,
         filters: Vec<Box<CuckooFilter>>,
+        num_deleted: u64,
     ) -> CuckooObject {
         let cuckoo = CuckooObject {
             expansion,
             bucket_size,
             max_kicks,
             filters,
+            num_deleted,
         };
 
         cuckoo.cuckoo_object_incr_metrics_on_new_create();
@@ -182,6 +189,7 @@ impl CuckooObject {
             bucket_size: from.bucket_size,
             max_kicks: from.max_kicks,
             filters,
+            num_deleted: from.num_deleted,
         };
 
         new_copy.cuckoo_object_incr_metrics_on_new_create();
@@ -211,18 +219,17 @@ impl CuckooObject {
         hash: &ItemHash,
         validate_size_limit: bool,
     ) -> Result<i64, CuckooError> {
-        let newest = self.filters.len() - 1;
-        // A local failure cache may suppress a command that would fail anyway.
-        // It must never choose an older filter or scaling over eviction: replicas
-        // do not see failed commands and may have no cache. Use it only when a
-        // failed direct insertion cannot lead to success in another filter.
-        let use_cache = self.filters[newest].saturated
-            && self.filters[..newest].iter().all(|filter| filter.sealed)
-            && self.scaling_capacity(validate_size_limit).is_err();
-        for (index, filter) in self.filters.iter_mut().enumerate().rev() {
-            if !filter.sealed && filter.add_hashed(hash, index == newest, use_cache).is_ok() {
+        // Version 5: reuse any directly available slot before spending RNG and
+        // MAXITERATIONS evictions in the newest filter. Keep newest-first order
+        // within this direct pass, independently of the local growth limit.
+        for filter in self.filters.iter_mut().rev() {
+            if !filter.sealed && filter.add_hashed(hash, false).is_ok() {
                 return Ok(1);
             }
+        }
+        let newest = self.filters.last_mut().expect("at least one filter");
+        if !newest.sealed && newest.add_hashed(hash, true).is_ok() {
+            return Ok(1);
         }
         let capacity = self.scaling_capacity(validate_size_limit)?;
         let mut filter = Box::new(CuckooFilter::new(
@@ -230,7 +237,7 @@ impl CuckooObject {
             self.bucket_size,
             self.max_kicks,
         ));
-        filter.add_hashed(hash, true, false)?;
+        filter.add_hashed(hash, true)?;
         // Retry saturated filters only after a deletion frees capacity. Seal
         // them only after a successful scale, so failed commands change no state.
         for previous in &mut self.filters {
@@ -272,6 +279,9 @@ impl CuckooObject {
         let hash = ExternalFilter::hash_item(item);
         for filter in self.filters.iter_mut().rev() {
             if filter.delete_hashed(&hash) {
+                // RESP integers are signed. Saturation is deterministic across
+                // persistence and replication and never wraps into a negative value.
+                self.num_deleted = (self.num_deleted + 1).min(i64::MAX as u64);
                 return Ok(1);
             }
         }
@@ -317,6 +327,10 @@ impl CuckooObject {
 
     pub fn num_items(&self) -> i64 {
         self.filters.iter().map(|f| f.num_items()).sum()
+    }
+
+    pub fn num_deleted(&self) -> i64 {
+        self.num_deleted as i64
     }
 
     pub fn num_filters(&self) -> usize {
@@ -377,10 +391,10 @@ impl CuckooObject {
         bytes <= configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.load(Ordering::Relaxed) as usize
     }
 
-    pub fn encode_object(&self) -> Result<Vec<u8>, CuckooError> {
+    pub fn encode_object(&self) -> Vec<u8> {
         // Fixed-width little-endian header, then metadata and raw buckets per filter.
         let size = 1
-            + 4 * 8
+            + 5 * 8
             + self
                 .filters
                 .iter()
@@ -397,20 +411,21 @@ impl CuckooObject {
             }
             bytes.extend_from_slice(filter.as_bytes());
         }
-        Ok(bytes)
+        bytes
     }
 
-    pub fn snapshot_header(&self) -> [u64; 4] {
+    pub fn snapshot_header(&self) -> [u64; 5] {
         [
             self.expansion as u64,
             self.bucket_size as u64,
             self.max_kicks as u64,
             self.filters.len() as u64,
+            self.num_deleted,
         ]
     }
 
-    pub fn validate_snapshot_header(header: [u64; 4]) -> Result<(), CuckooError> {
-        let [expansion, bucket_size, max_kicks, count] = header;
+    pub fn validate_snapshot_header(header: [u64; 5]) -> Result<(), CuckooError> {
+        let [expansion, bucket_size, max_kicks, count, num_deleted] = header;
         if !(MIN_BUCKET_SIZE as u64..=MAX_BUCKET_SIZE as u64).contains(&bucket_size) {
             return Err(CuckooError::BadBucketSize);
         }
@@ -422,7 +437,10 @@ impl CuckooObject {
         if expansion > configs::CUCKOO_EXPANSION_MAX as u64 {
             return Err(CuckooError::BadExpansion);
         }
-        if count == 0 || count > CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX as u64 {
+        if count == 0
+            || count > CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX as u64
+            || num_deleted > i64::MAX as u64
+        {
             return Err(CuckooError::DecodeFilterFailed);
         }
         Ok(())
@@ -443,9 +461,35 @@ impl CuckooObject {
             }
             Ok(fields)
         }
-        let fields @ [expansion, bucket_size, max_kicks, count] = header(&mut bytes)?;
+        let fields @ [expansion, bucket_size, max_kicks, count, num_deleted] = header(&mut bytes)?;
         Self::validate_snapshot_header(fields)?;
-        let mut filters = Vec::with_capacity(1);
+        // Inspect every subfilter before allocating bucket storage. Reserve the
+        // pointer-vector capacity produced by the previous incremental decoder.
+        let vector_capacity = if count == 1 {
+            1
+        } else {
+            (count as usize).next_power_of_two().max(4)
+        };
+        let mut remaining = bytes;
+        let mut size = Self::compute_size(vector_capacity);
+        for _ in 0..count {
+            let fields = header(&mut remaining)?;
+            let buckets = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
+            remaining = remaining
+                .get(buckets..)
+                .ok_or(CuckooError::DecodeFilterFailed)?;
+            size = size
+                .checked_add(std::mem::size_of::<CuckooFilter>())
+                .and_then(|n| n.checked_add(buckets))
+                .ok_or(CuckooError::DecodeFilterFailed)?;
+        }
+        if !remaining.is_empty() {
+            return Err(CuckooError::DecodeFilterFailed);
+        }
+        if validate_size_limit && !Self::validate_size(size) {
+            return Err(CuckooError::ExceedsMaxSize);
+        }
+        let mut filters = Vec::with_capacity(vector_capacity);
         for _ in 0..count {
             let fields = header(&mut bytes)?;
             let size = CuckooFilter::validate_snapshot_header(fields, bucket_size as usize)?;
@@ -467,10 +511,9 @@ impl CuckooObject {
             bucket_size as usize,
             max_kicks as u32,
             filters,
+            num_deleted,
         );
-        if validate_size_limit && !Self::validate_size(object.memory_usage()) {
-            return Err(CuckooError::ExceedsMaxSize);
-        }
+        debug_assert_eq!(size, object.memory_usage());
         Ok(object)
     }
 
@@ -496,7 +539,7 @@ impl Drop for CuckooObject {
 }
 
 // SipHash-1-3 with fixed keys and canonical length encoding. Keep hashing
-// unchanged for the lifetime of persistence version 3.
+// unchanged for the lifetime of persistence versions 3 through 5.
 #[derive(Clone, Default)]
 pub struct FixedHasher(siphasher::sip::SipHasher13);
 impl Hasher for FixedHasher {
@@ -519,8 +562,6 @@ pub struct CuckooFilter {
     capacity: i64,
     bucket_size: usize,
     sealed: bool,
-    // Local failure cache: never serialized, copied, or included in the digest.
-    saturated: bool,
 }
 
 impl CuckooFilter {
@@ -537,7 +578,6 @@ impl CuckooFilter {
             capacity,
             bucket_size,
             sealed: false,
-            saturated: false,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         result
@@ -604,7 +644,6 @@ impl CuckooFilter {
             capacity: capacity as i64,
             bucket_size,
             sealed: sealed != 0,
-            saturated: false,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         Ok(result)
@@ -618,21 +657,15 @@ impl CuckooFilter {
         self.filter.realloc_buckets(f);
     }
 
-    fn add_hashed(
-        &mut self,
-        hash: &ItemHash,
-        allow_eviction: bool,
-        use_cache: bool,
-    ) -> Result<(), CuckooError> {
-        let inserted = if !allow_eviction || (use_cache && self.saturated) {
-            self.filter.try_add_no_evict_hashed(hash)
-        } else if self.filter.len() == self.as_bytes().len() {
-            self.saturated = true;
+    fn add_hashed(&mut self, hash: &ItemHash, allow_eviction: bool) -> Result<(), CuckooError> {
+        // Occupancy is proof of fullness for every hash. A failed eviction is
+        // only evidence about that attempt, so it must not suppress later ones.
+        let inserted = if self.filter.len() == self.as_bytes().len() {
             false
+        } else if !allow_eviction {
+            self.filter.try_add_no_evict_hashed(hash)
         } else {
-            let inserted = self.filter.try_add_hashed(hash).is_ok();
-            self.saturated = !inserted;
-            inserted
+            self.filter.try_add_hashed(hash).is_ok()
         };
         if !inserted {
             return Err(CuckooError::FilterFull);
@@ -645,7 +678,6 @@ impl CuckooFilter {
         let deleted = self.filter.delete_hashed(hash);
         if deleted {
             self.sealed = false;
-            self.saturated = false;
             crate::metrics::CUCKOO_NUM_ITEMS_ACROSS_OBJECTS.fetch_sub(1, Ordering::Relaxed);
         }
         deleted
@@ -668,7 +700,6 @@ impl CuckooFilter {
             capacity: from.capacity,
             bucket_size: from.bucket_size,
             sealed: from.sealed,
-            saturated: false,
         };
         result.cuckoo_filter_incr_metrics_on_new_create();
         result
@@ -722,9 +753,9 @@ mod tests {
         for count in 1..=10 {
             assert_eq!(object.add_item(item, false), Ok(1));
             assert_eq!(object.count_item(item), count);
-            let before = object.encode_object().unwrap();
+            let before = object.encode_object();
             assert_eq!(object.add_item_nx(item, false), Ok(0));
-            assert_eq!(before, object.encode_object().unwrap());
+            assert_eq!(before, object.encode_object());
         }
         for count in (0..10).rev() {
             assert_eq!(object.delete_item(item), Ok(1));
@@ -789,7 +820,7 @@ mod tests {
         let item = b"test_item";
         co.add_item(item, false).unwrap();
 
-        let encoded = co.encode_object().unwrap();
+        let encoded = co.encode_object();
         assert!(!encoded.is_empty());
 
         let decoded = CuckooObject::decode_object(&encoded, false).unwrap();
@@ -805,24 +836,18 @@ mod tests {
         for item in 0..70_u64 {
             original.add_item(&item.to_le_bytes(), false).unwrap();
         }
-        let bytes = original.encode_object().unwrap();
+        let bytes = original.encode_object();
         let mut restored = CuckooObject::decode_object(&bytes, false).unwrap();
         let mut copied = CuckooObject::create_copy_from(&original);
-        assert_eq!(bytes, restored.encode_object().unwrap());
-        assert_eq!(bytes, copied.encode_object().unwrap());
+        assert_eq!(bytes, restored.encode_object());
+        assert_eq!(bytes, copied.encode_object());
         for item in 70..300_u64 {
             let key = item.to_le_bytes();
             original.add_item(&key, false).unwrap();
             restored.add_item(&key, false).unwrap();
             copied.add_item(&key, false).unwrap();
-            assert_eq!(
-                original.encode_object().unwrap(),
-                restored.encode_object().unwrap()
-            );
-            assert_eq!(
-                original.encode_object().unwrap(),
-                copied.encode_object().unwrap()
-            );
+            assert_eq!(original.encode_object(), restored.encode_object());
+            assert_eq!(original.encode_object(), copied.encode_object());
         }
         assert!(original
             .filters
@@ -839,9 +864,9 @@ mod tests {
             object.add_item(&item.to_le_bytes(), false).unwrap();
         }
         assert!(object.num_filters() > 1);
-        let before = object.encode_object().unwrap();
+        let before = object.encode_object();
         object.add_item(key, false).unwrap();
-        assert_ne!(before, object.encode_object().unwrap());
+        assert_ne!(before, object.encode_object());
         assert_eq!(object.count_item(key), 2);
         assert_eq!(object.delete_item(key).unwrap(), 1);
         assert!(object.item_exists(key));
@@ -855,11 +880,11 @@ mod tests {
         let mut inserted = Vec::new();
         for item in 0..100_u64 {
             let key = item.to_le_bytes();
-            let before = object.encode_object().unwrap();
+            let before = object.encode_object();
             if object.add_item(&key, false).is_ok() {
                 inserted.push(key);
             } else {
-                assert_eq!(before, object.encode_object().unwrap());
+                assert_eq!(before, object.encode_object());
             }
             for key in &inserted {
                 assert!(object.item_exists(key));
@@ -870,7 +895,7 @@ mod tests {
     #[test]
     fn reject_corrupt_snapshots() {
         let object = CuckooObject::new_reserved(32, 4, 20, 2, false).unwrap();
-        let bytes = object.encode_object().unwrap();
+        let bytes = object.encode_object();
         for end in 0..bytes.len() {
             assert!(CuckooObject::decode_object(&bytes[..end], false).is_err());
         }
@@ -884,12 +909,13 @@ mod tests {
             (17, 0),
             (25, 0),
             (25, 1025),
-            (33, 0),
-            (41, 1),
-            (57, 16),
-            (65, 2),
-            (73, 31),
-            (73, u64::MAX),
+            (33, u64::MAX),
+            (41, 0),
+            (49, 1),
+            (65, 16),
+            (73, 2),
+            (81, 31),
+            (81, u64::MAX),
         ] {
             let mut invalid = bytes.clone();
             invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -898,7 +924,7 @@ mod tests {
                 "offset {offset}"
             );
         }
-        for version in [1, 2, 255] {
+        for version in [1, 2, 3, 4, 255] {
             let mut invalid = bytes.clone();
             invalid[0] = version;
             assert!(matches!(
@@ -906,6 +932,63 @@ mod tests {
                 Err(CuckooError::DecodeUnsupportedVersion)
             ));
         }
+    }
+
+    #[test]
+    fn direct_insertion_prefers_newest_when_both_filters_have_space() {
+        let mut object = CuckooObject::from_existing(
+            2,
+            4,
+            20,
+            vec![
+                Box::new(CuckooFilter::new(64, 4, 20)),
+                Box::new(CuckooFilter::new(128, 4, 20)),
+            ],
+            0,
+        );
+        let old_header = object.filters[0].snapshot_header();
+        let old_buckets = object.filters[0].as_bytes().to_vec();
+        let rng = object.filters[1].snapshot_header()[2..4].to_vec();
+        assert_eq!(object.add_item(b"available-in-both", false), Ok(1));
+        assert_eq!(object.filters[0].snapshot_header(), old_header);
+        assert_eq!(object.filters[0].as_bytes(), old_buckets);
+        assert_eq!(object.filters[1].num_items(), 1);
+        assert_eq!(object.filters[1].snapshot_header()[2..4], rng);
+    }
+
+    #[test]
+    fn direct_old_slot_precedes_useful_newest_eviction() {
+        let mut newest = CuckooFilter::new(64, 4, 20);
+        for item in 0..1000 {
+            let hash = ExternalFilter::hash_item(item.to_string().as_bytes());
+            if newest.add_hashed(&hash, true).is_err() {
+                break;
+            }
+        }
+        let candidate = (1000..10000)
+            .map(|i| i.to_string())
+            .find(|key| {
+                let hash = ExternalFilter::hash_item(key.as_bytes());
+                let mut probe = CuckooFilter::create_copy_from(&newest);
+                probe.add_hashed(&hash, false).is_err() && probe.add_hashed(&hash, true).is_ok()
+            })
+            .expect("a deterministic useful eviction");
+        let mut old = CuckooFilter::new(64, 4, 20);
+        let deleted = ExternalFilter::hash_item(b"deleted".as_slice());
+        old.add_hashed(&deleted, false).unwrap();
+        old.sealed = true;
+        assert!(old.delete_hashed(&deleted));
+        let mut object =
+            CuckooObject::from_existing(2, 4, 20, vec![Box::new(old), Box::new(newest)], 0);
+        let mut restored = CuckooObject::decode_object(&object.encode_object(), false).unwrap();
+        let before_header = object.filters[1].snapshot_header();
+        let before_buckets = object.filters[1].as_bytes().to_vec();
+        assert_eq!(object.add_item(candidate.as_bytes(), false), Ok(1));
+        assert_eq!(restored.add_item(candidate.as_bytes(), false), Ok(1));
+        assert_eq!(object.encode_object(), restored.encode_object());
+        assert_eq!(object.filters[0].num_items(), 1);
+        assert_eq!(object.filters[1].snapshot_header(), before_header);
+        assert_eq!(object.filters[1].as_bytes(), before_buckets);
     }
 
     #[test]
@@ -933,9 +1016,9 @@ mod tests {
         }
         assert!(object.num_items() > object.capacity());
         assert_eq!(object.num_filters(), 1);
-        let snapshot = object.encode_object().unwrap();
+        let snapshot = object.encode_object();
         let restored = CuckooObject::decode_object(&snapshot, false).unwrap();
-        assert_eq!(snapshot, restored.encode_object().unwrap());
+        assert_eq!(snapshot, restored.encode_object());
     }
     #[test]
     fn fingerprint_collision_survives_deleting_other_item() {
@@ -965,7 +1048,156 @@ mod tests {
     }
 
     #[test]
-    fn saturated_cache_preserves_successful_replication_and_resets_after_delete() {
+    fn deletion_count_survives_copy_snapshot_and_saturates() {
+        let mut object = CuckooObject::new_reserved(32, 4, 20, 2, false).unwrap();
+        assert_eq!(object.delete_item(b"missing"), Ok(0));
+        assert_eq!(object.num_deleted(), 0);
+        object.add_item(b"item", false).unwrap();
+        assert_eq!(object.delete_item(b"item"), Ok(1));
+        assert_eq!(object.num_deleted(), 1);
+        assert_eq!(CuckooObject::create_copy_from(&object).num_deleted(), 1);
+        let restored = CuckooObject::decode_object(&object.encode_object(), false).unwrap();
+        assert_eq!(restored.num_deleted(), 1);
+        object.num_deleted = i64::MAX as u64;
+        object.add_item(b"item", false).unwrap();
+        assert_eq!(object.delete_item(b"item"), Ok(1));
+        assert_eq!(object.num_deleted(), i64::MAX);
+        let restored = CuckooObject::decode_object(&object.encode_object(), false).unwrap();
+        assert_eq!(restored.num_deleted(), i64::MAX);
+    }
+
+    // All tests that change the global Cuckoo memory limit belong here. Other
+    // unit tests bypass this limit; the guard restores it even on assertion failure.
+    #[test]
+    fn memory_limit_preflights_allocations_and_can_be_raised_after_failure() {
+        use crate::test_allocator::largest_allocation;
+        struct ResetLimit(i64);
+        impl Drop for ResetLimit {
+            fn drop(&mut self) {
+                configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.store(self.0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetLimit(configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.load(Ordering::Relaxed));
+        for capacities in [vec![16 * 1024 * 1024], vec![1024 * 1024; 3]] {
+            let mut filters = Vec::with_capacity(1);
+            for &capacity in &capacities {
+                filters.push(Box::new(CuckooFilter::new(capacity, 4, 20)));
+            }
+            let object = CuckooObject::from_existing(2, 4, 20, filters, 0);
+            let snapshot = object.encode_object();
+            let exact_size = object.memory_usage();
+            for limit in [1024, exact_size - 1, exact_size] {
+                configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.store(limit as i64, Ordering::Relaxed);
+                let (result, largest) =
+                    largest_allocation(|| CuckooObject::decode_object(&snapshot, true));
+                if limit < exact_size {
+                    assert!(matches!(result, Err(CuckooError::ExceedsMaxSize)));
+                    assert_eq!(largest, 0, "oversized snapshot allocated before rejection");
+                } else {
+                    let restored = result.unwrap();
+                    assert_eq!(restored.memory_usage(), exact_size);
+                    assert_eq!(restored.encode_object(), snapshot);
+                    assert_eq!(largest, capacities[0] as usize);
+                }
+            }
+            configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.store(0, Ordering::Relaxed);
+            assert!(CuckooObject::decode_object(&snapshot, false).is_ok());
+        }
+        let mut original = CuckooObject::new_reserved(64, 4, 1, 2, false).unwrap();
+        configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT
+            .store(original.memory_usage() as i64, Ordering::Relaxed);
+        let mut failures = 0;
+        for item in 0..300 {
+            let key = item.to_string();
+            let before = original.encode_object();
+            let mut copy = CuckooObject::create_copy_from(&original);
+            let result = original.add_item(key.as_bytes(), true);
+            assert_eq!(result, copy.add_item(key.as_bytes(), true));
+            assert_eq!(original.encode_object(), copy.encode_object());
+            if result.is_err() {
+                failures += 1;
+                assert_eq!(before, original.encode_object());
+            }
+        }
+        assert!(failures > 0);
+        configs::CUCKOO_MEMORY_LIMIT_PER_OBJECT.store(1_000_000, Ordering::Relaxed);
+        original.add_item(b"growth is allowed again", true).unwrap();
+        assert_eq!(original.num_filters(), 2);
+    }
+
+    #[test]
+    fn failed_insert_does_not_suppress_other_hashes() {
+        let mut original = CuckooObject::new_reserved(64, 4, 1, 0, false).unwrap();
+        let mut failures = 0;
+        let mut successes_after_failure = 0;
+        for item in 0..300 {
+            let key = item.to_string();
+            let before = original.encode_object();
+            let mut copied = CuckooObject::create_copy_from(&original);
+            let mut restored = CuckooObject::decode_object(&before, false).unwrap();
+            let result = original.add_item(key.as_bytes(), false);
+            assert_eq!(
+                result,
+                copied.add_item(key.as_bytes(), false),
+                "item {item}"
+            );
+            assert_eq!(
+                result,
+                restored.add_item(key.as_bytes(), false),
+                "item {item}"
+            );
+            let after = original.encode_object();
+            assert_eq!(after, copied.encode_object());
+            assert_eq!(after, restored.encode_object());
+            if result.is_err() {
+                failures += 1;
+                assert_eq!(before, after);
+            } else if failures > 0 {
+                successes_after_failure += 1;
+            }
+        }
+        assert!(failures > 1 && successes_after_failure > 1);
+    }
+
+    #[test]
+    fn filter_count_limit_keeps_evictions_and_old_slots_available() {
+        let mut filters = Vec::new();
+        for _ in 0..CUCKOO_NUM_FILTERS_PER_OBJECT_LIMIT_MAX {
+            let mut filter = CuckooFilter::new(64, 4, 1);
+            filter.sealed = true;
+            filters.push(Box::new(filter));
+        }
+        let old_hash = ExternalFilter::hash_item(b"old sentinel".as_slice());
+        filters[0].add_hashed(&old_hash, false).unwrap();
+        filters.last_mut().unwrap().sealed = false;
+        let mut original = CuckooObject::from_existing(2, 4, 1, filters, 0);
+        let mut failures = 0;
+        let mut accepted_after_failure = 0;
+        for item in 0..300 {
+            // Simulate a deletion from an older subfilter once growth is blocked.
+            if item == 50 {
+                assert!(original.filters[0].delete_hashed(&old_hash));
+            }
+            let key = item.to_string();
+            let before = original.encode_object();
+            let mut copy = CuckooObject::create_copy_from(&original);
+            let result = original.add_item(key.as_bytes(), false);
+            assert_eq!(result, copy.add_item(key.as_bytes(), false));
+            assert_eq!(original.encode_object(), copy.encode_object());
+            if result.is_err() {
+                assert_eq!(result, Err(CuckooError::MaxNumScalingFilters));
+                assert_eq!(before, original.encode_object());
+                failures += 1;
+            } else if failures > 0 {
+                accepted_after_failure += 1;
+            }
+        }
+        assert!(failures > 0 && accepted_after_failure > 0);
+        assert!(original.filters[0].num_items() > 0);
+    }
+
+    #[test]
+    fn full_filter_preserves_successful_replication_and_reuses_deletion() {
         let mut primary = CuckooObject::new_reserved(64, 4, 32, 0, false).unwrap();
         let mut replica = CuckooObject::create_copy_from(&primary);
         let mut accepted = Vec::new();
@@ -975,16 +1207,14 @@ mod tests {
                 accepted.push(key);
                 replica.add_item(&key, false).unwrap();
             }
-            assert_eq!(
-                primary.encode_object().unwrap(),
-                replica.encode_object().unwrap()
-            );
+            assert_eq!(primary.encode_object(), replica.encode_object());
         }
-        assert!(primary.filters[0].saturated);
-        assert!(!replica.filters[0].saturated);
-        assert!(!CuckooObject::create_copy_from(&primary).filters[0].saturated);
+        assert_eq!(
+            primary.num_items() as usize,
+            primary.filters[0].as_bytes().len()
+        );
         primary.delete_item(&accepted[0]).unwrap();
-        assert!(!primary.filters[0].saturated);
+        primary.add_item(&accepted[0], false).unwrap();
     }
 
     #[test]
@@ -1010,12 +1240,26 @@ mod tests {
     const EXPECTED_RNG_WORD_POS: u128 = 291;
 
     #[test]
+    fn slice_hash_representation_stays_compatible() {
+        use std::hash::Hash;
+        for length in 0..=1024 {
+            let data: Vec<u8> = (0..length).map(|i| (i * 37) as u8).collect();
+            let mut through_std = FixedHasher::default();
+            data.as_slice().hash(&mut through_std);
+            let mut canonical = FixedHasher::default();
+            canonical.write(&(length as u64).to_le_bytes());
+            canonical.write(&data);
+            assert_eq!(through_std.finish(), canonical.finish(), "length {length}");
+        }
+    }
+
+    #[test]
     fn deterministic_snapshot_fixture() {
         let mut filter =
             ExternalFilter::with_config_and_rng(64, 4, 32, ChaCha8Rng::seed_from_u64(42)).unwrap();
         let mut accepted = Vec::new();
         for item in 0..100_u64 {
-            if filter.try_add(&item.to_le_bytes()).is_ok() {
+            if filter.try_add(item.to_le_bytes().as_slice()).is_ok() {
                 accepted.push(item);
             }
         }
@@ -1024,7 +1268,7 @@ mod tests {
         assert_eq!(filter.as_bytes(), EXPECTED_BUCKETS);
         assert_eq!(filter.rng().get_word_pos(), EXPECTED_RNG_WORD_POS);
         for item in &accepted {
-            assert!(filter.contains(&item.to_le_bytes()));
+            assert!(filter.contains(item.to_le_bytes().as_slice()));
         }
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
@@ -1038,12 +1282,12 @@ mod tests {
         )
         .unwrap();
         for item in accepted.iter().step_by(3) {
-            assert!(filter.delete(&item.to_le_bytes()));
-            assert!(restored.delete(&item.to_le_bytes()));
+            assert!(filter.delete(item.to_le_bytes().as_slice()));
+            assert!(restored.delete(item.to_le_bytes().as_slice()));
         }
         let position = filter.rng().get_word_pos();
         for item in 100..150_u64 {
-            let h = ExternalFilter::hash_item(&item.to_le_bytes());
+            let h = ExternalFilter::hash_item(item.to_le_bytes().as_slice());
             assert_eq!(
                 filter.try_add_hashed(&h).is_ok(),
                 restored.try_add_hashed(&h).is_ok()
@@ -1055,7 +1299,7 @@ mod tests {
         assert!(filter.rng().get_word_pos() > position);
     }
     #[test]
-    fn cached_failure_does_not_change_choice_of_unsealed_filter() {
+    fn failed_insertion_preserves_replication_after_reusing_old_filter() {
         let mut primary = CuckooObject::new_reserved(64, 4, 1, 2, false).unwrap();
         for item in 0..80_u64 {
             primary.add_item(&item.to_le_bytes(), false).unwrap();
@@ -1068,9 +1312,8 @@ mod tests {
                 break;
             }
         }
-        assert!(primary.filters.last().unwrap().saturated);
         let mut replica = CuckooObject::create_copy_from(&primary);
-        // A deletion in an older filter leaves the newest filter's local cache set.
+        // Deletion makes an older filter reusable after a failure in the newest.
         for item in 0..32_u64 {
             let hash = ExternalFilter::hash_item(&item.to_le_bytes());
             assert_eq!(
@@ -1084,8 +1327,8 @@ mod tests {
                 replica.add_item(&key, false).unwrap();
             }
             assert_eq!(
-                primary.encode_object().unwrap(),
-                replica.encode_object().unwrap(),
+                primary.encode_object(),
+                replica.encode_object(),
                 "item {item}"
             );
         }

@@ -1,6 +1,6 @@
 import pytest
 from valkey.exceptions import NoPermissionError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 
 
 READ_COMMANDS = {'cf.exists', 'cf.mexists', 'cf.count', 'cf.info'}
@@ -13,7 +13,7 @@ def category_commands(client, category):
             for command in client.execute_command('ACL', 'CAT', category)}
 
 
-class TestCuckooACLCategory(ValkeyBloomTestCaseBase):
+class TestCuckooACLCategory(CuckooTestCase):
 
     def test_cuckoo_acl_category(self):
         client = self.server.get_new_client()

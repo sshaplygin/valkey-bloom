@@ -1,13 +1,12 @@
 import os
-import time
 import pytest
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 from valkey_test_case import ValkeyServerHandle
 from valkeytestframework.util.waiters import *
 from cuckoo_test_utils import rewrite_cuckoo_aof
 
-class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
+class TestCuckooAOFRewrite(CuckooTestCase):
 
     @pytest.fixture(autouse=True)
     def configure_aof(self, setup_test):
@@ -17,7 +16,7 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         client = self.server.get_new_client()
         client.config_set('aof-use-rdb-preamble', 'no')
         client.execute_command('CONFIG', 'SET', 'appendonly', 'yes')
-        time.sleep(0.5)
+        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0)
 
     @pytest.mark.parametrize('rdb_preamble', ['yes', 'no'])
     def test_basic_aof_rewrite(self, rdb_preamble):
@@ -27,7 +26,7 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         client.config_set('aof-use-rdb-preamble', rdb_preamble)
 
         # Create and populate filter
-        client.execute_command('CF.RESERVE', 'aofTest', 1000)
+        client.execute_command('CF.RESERVE', 'aofTest', 1000000, 'BUCKETSIZE', 5)
         client.execute_command('CF.ADD', 'aofTest', 'item1')
         client.execute_command('CF.ADD', 'aofTest', 'item1')  # Duplicate
         client.execute_command('CF.ADD', 'aofTest', 'item2')
@@ -39,12 +38,13 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Trigger AOF rewrite
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         # Restart server to load from AOF
+        self.server.args['bf.cuckoo-memory-usage-limit'] = '1024'
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify data restored from AOF
         count_after = client.execute_command('CF.COUNT', 'aofTest', 'item1')
@@ -74,11 +74,11 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Rewrite and restart
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify deletions persisted
         assert client.execute_command('CF.EXISTS', 'delAOF', 'keep1') == 1
@@ -98,12 +98,12 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Trigger rewrite
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         # Restart
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify all filters restored
         for i in range(10):
@@ -129,11 +129,11 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Rewrite and restart
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify scaled filter restored correctly
         info_after = client.execute_command('CF.INFO', 'scaleAOF')
@@ -163,11 +163,11 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Rewrite and restart
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify counts preserved
         count1_after = client.execute_command('CF.COUNT', 'countAOF', 'item1')
@@ -196,11 +196,11 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Rewrite and restart
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify options preserved
         info_after = client.execute_command('CF.INFO', 'optAOF')
@@ -217,7 +217,7 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Add some data
         client.execute_command('CF.ADD', 'incrAOF', 'item1')
         client.execute_command('CF.ADD', 'incrAOF', 'item2')
-        time.sleep(0.5)
+        wait_for_equal(lambda: client.info('persistence')['aof_current_size'] > 0, True)
 
         # Verify incremental AOF is working
         aof_size_before = client.info('persistence').get('aof_current_size', 0)
@@ -226,7 +226,7 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Add more data
         for i in range(10):
             client.execute_command('CF.ADD', 'incrAOF', f'more{i}')
-        time.sleep(0.5)
+        wait_for_equal(lambda: client.info('persistence')['aof_current_size'] > aof_size_before, True)
 
         # AOF should have grown
         aof_size_after = client.info('persistence').get('aof_current_size', 0)
@@ -235,12 +235,12 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Now rewrite
         client.execute_command('BGREWRITEAOF')
         wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=10)
-        time.sleep(1)
+        assert client.info('persistence')['aof_last_bgrewrite_status'] == 'ok'
 
         # Restart
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         # Verify all data present
         assert client.execute_command('CF.EXISTS', 'incrAOF', 'item1') == 1
@@ -254,6 +254,9 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         client.execute_command('CF.RESERVE', 'loadCmdTest', 1000)
         client.execute_command('CF.ADD', 'loadCmdTest', 'item1')
 
+        client.execute_command('CF.ADD', 'loadCmdTest', 'deleted')
+        assert client.execute_command('CF.DEL', 'loadCmdTest', 'deleted') == 1
+        assert client.execute_command('CF.INFO', 'loadCmdTest', 'Number of items deleted') == 1
         before = client.dump('loadCmdTest')
         snapshots = rewrite_cuckoo_aof(client, self.server)
         assert b'loadCmdTest' in snapshots
@@ -263,9 +266,12 @@ class TestCuckooAOFRewrite(ValkeyBloomTestCaseBase):
         # Restart to verify
         self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
         assert self.server.is_alive()
-        time.sleep(1)
+        wait_for_equal(lambda: self.server.get_new_client().info('persistence')['loading'], 0)
 
         exists = client.execute_command('CF.EXISTS', 'loadCmdTest', 'item1')
         assert exists == 1
         assert client.dump('loadCmdTest') == before
         assert client.dump('loadedCopy') == before
+
+        assert client.execute_command('CF.INFO', 'loadCmdTest', 'Number of items deleted') == 1
+        assert client.execute_command('CF.INFO', 'loadedCopy', 'Number of items deleted') == 1

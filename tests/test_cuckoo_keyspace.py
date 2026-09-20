@@ -1,10 +1,10 @@
 import time
 import pytest
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 from cuckoo_test_utils import rewrite_cuckoo_aof
 
-class TestCuckooKeyspace(ValkeyBloomTestCaseBase):
+class TestCuckooKeyspace(CuckooTestCase):
 
     @pytest.fixture(autouse=True)
     def configure_keyspace_events(self, setup_test):
@@ -239,3 +239,24 @@ class TestCuckooKeyspace(ValkeyBloomTestCaseBase):
             assert client.execute_command('CF.ADD', 'duplicate', 'item') == 1
             message = pubsub.get_message(timeout=1)
             assert message['data'] == b'duplicate'
+
+    def test_unsuccessful_delete_emits_no_event(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'filter', 64)
+        with client.pubsub() as pubsub:
+            pubsub.subscribe('__keyevent@0__:cuckoo.del')
+            assert pubsub.get_message(timeout=5)['type'] == 'subscribe'
+            for marker in [b'before-insert', b'after-delete']:
+                assert client.execute_command('CF.DEL', 'filter', 'item') == 0
+                # The pong follows any event emitted by the completed command.
+                pubsub.ping(marker)
+                message = pubsub.get_message(timeout=5)
+                assert message['type'] == 'pong'
+                assert message['data'] == marker
+                if marker == b'before-insert':
+                    assert client.execute_command('CF.ADD', 'filter', 'item') == 1
+                    assert client.execute_command('CF.DEL', 'filter', 'item') == 1
+                    message = pubsub.get_message(timeout=5)
+                    assert message['type'] == 'message'
+                    assert message['channel'] == b'__keyevent@0__:cuckoo.del'
+                    assert message['data'] == b'filter'

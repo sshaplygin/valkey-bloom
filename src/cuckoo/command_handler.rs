@@ -1,8 +1,8 @@
 use crate::configs;
 use crate::cuckoo::data_type::CUCKOO_TYPE;
 use crate::cuckoo::utils::{
-    CuckooObject, ADD_EVENT, BAD_BUCKET_SIZE, BAD_CAPACITY, BAD_EXPANSION, BAD_MAX_ITERATIONS,
-    BUCKET_SIZE_ARG_REQUIRED, BUCKET_SIZE_OUT_OF_RANGE, CAPACITY_ARG_REQUIRED,
+    self, CuckooObject, ADD_EVENT, BAD_BUCKET_SIZE, BAD_CAPACITY, BAD_EXPANSION,
+    BAD_MAX_ITERATIONS, BUCKET_SIZE_ARG_REQUIRED, BUCKET_SIZE_OUT_OF_RANGE, CAPACITY_ARG_REQUIRED,
     CAPACITY_MUST_BE_LARGER_THAN_ZERO, CAPACITY_OUT_OF_RANGE, CREATE_EVENT, DEL_EVENT,
     EXPANSION_ARG_REQUIRED, FAILED_TO_SET_FILTER, INSERT_EVENT, ITEMS_KEYWORD_REQUIRED,
     ITEM_EXISTS, LOAD_EVENT, MAX_ITERATIONS_ARG_REQUIRED, MAX_KICKS_OUT_OF_RANGE, NOT_FOUND,
@@ -18,24 +18,19 @@ fn validate_capacity(capacity: i64) -> Result<(), ValkeyError> {
     if capacity == 0 {
         return Err(ValkeyError::Str(CAPACITY_MUST_BE_LARGER_THAN_ZERO));
     }
-    if !(configs::CUCKOO_CAPACITY_MIN..=configs::CUCKOO_CAPACITY_MAX).contains(&capacity) {
-        return Err(ValkeyError::Str(CAPACITY_OUT_OF_RANGE));
-    }
-    Ok(())
+    utils::validate_capacity(capacity).map_err(|_| ValkeyError::Str(CAPACITY_OUT_OF_RANGE))
 }
 
 fn validate_bucket_size(bucket_size: i64) -> Result<(), ValkeyError> {
-    if !(configs::CUCKOO_BUCKET_SIZE_MIN..=configs::CUCKOO_BUCKET_SIZE_MAX).contains(&bucket_size) {
-        return Err(ValkeyError::Str(BUCKET_SIZE_OUT_OF_RANGE));
-    }
-    Ok(())
+    let bucket_size =
+        usize::try_from(bucket_size).map_err(|_| ValkeyError::Str(BUCKET_SIZE_OUT_OF_RANGE))?;
+    utils::validate_bucket_size(bucket_size).map_err(|_| ValkeyError::Str(BUCKET_SIZE_OUT_OF_RANGE))
 }
 
 fn validate_max_kicks(max_kicks: i64) -> Result<(), ValkeyError> {
-    if !(configs::CUCKOO_MAX_KICKS_MIN..=configs::CUCKOO_MAX_KICKS_MAX).contains(&max_kicks) {
-        return Err(ValkeyError::Str(MAX_KICKS_OUT_OF_RANGE));
-    }
-    Ok(())
+    let max_kicks =
+        u32::try_from(max_kicks).map_err(|_| ValkeyError::Str(MAX_KICKS_OUT_OF_RANGE))?;
+    utils::validate_max_kicks(max_kicks).map_err(|_| ValkeyError::Str(MAX_KICKS_OUT_OF_RANGE))
 }
 
 // Creation always carries every property, even if the first insertion fails.
@@ -76,7 +71,6 @@ fn replicate_items(ctx: &Context, args: &[ValkeyString], item_idx: usize, respon
             values
                 .iter()
                 .zip(&args[item_idx..])
-                .take_while(|(v, _)| matches!(v, ValkeyValue::Integer(_)))
                 .filter_map(|(v, item)| matches!(v, ValkeyValue::Integer(1)).then_some(item)),
         ),
         Ok(ValkeyValue::Integer(1)) => command.push(&args[item_idx]),
@@ -259,13 +253,9 @@ fn insert_items(
     response
 }
 
-/// Implements CF.ADD and CF.MADD commands.
-pub fn cuckoo_filter_add_value(
-    ctx: &Context,
-    args: Vec<ValkeyString>,
-    multi: bool,
-) -> ValkeyResult {
-    if (!multi && args.len() != 3) || args.len() < 3 {
+/// Implements CF.ADD command.
+pub fn cuckoo_filter_add_value(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
     }
     insert_items(
@@ -273,15 +263,15 @@ pub fn cuckoo_filter_add_value(
         &args,
         InsertOptions::default(),
         2,
-        multi,
+        false,
         false,
         ADD_EVENT,
     )
 }
 
-/// Implements CF.ADDNX and CF.MADDNX commands.
-pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>, multi: bool) -> ValkeyResult {
-    if (!multi && args.len() != 3) || args.len() < 3 {
+/// Implements CF.ADDNX command.
+pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
     }
     insert_items(
@@ -289,7 +279,7 @@ pub fn cuckoo_filter_addnx(ctx: &Context, args: Vec<ValkeyString>, multi: bool) 
         &args,
         InsertOptions::default(),
         2,
-        multi,
+        false,
         true,
         ADD_EVENT,
     )
@@ -546,6 +536,7 @@ pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
                             .sum(),
                     )),
                     "NUMBER OF ITEMS INSERTED" => Ok(ValkeyValue::Integer(cuckoo.num_items())),
+                    "NUMBER OF ITEMS DELETED" => Ok(ValkeyValue::Integer(cuckoo.num_deleted())),
                     "NUMBER OF FILTERS" => Ok(ValkeyValue::Integer(cuckoo.num_filters() as i64)),
                     "BUCKET SIZE" => Ok(ValkeyValue::Integer(cuckoo.bucket_size() as i64)),
                     "MAX ITERATIONS" => Ok(ValkeyValue::Integer(cuckoo.max_kicks() as i64)),
@@ -566,6 +557,8 @@ pub fn cuckoo_filter_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
                 ),
                 ValkeyValue::SimpleStringStatic("Number of items inserted"),
                 ValkeyValue::Integer(cuckoo.num_items()),
+                ValkeyValue::SimpleStringStatic("Number of items deleted"),
+                ValkeyValue::Integer(cuckoo.num_deleted()),
                 ValkeyValue::SimpleStringStatic("Number of filters"),
                 ValkeyValue::Integer(cuckoo.num_filters() as i64),
                 ValkeyValue::SimpleStringStatic("Bucket size"),

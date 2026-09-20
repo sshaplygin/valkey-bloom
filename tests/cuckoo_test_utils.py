@@ -2,7 +2,17 @@
 
 from pathlib import Path
 
+import pytest
+from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+
 from valkeytestframework.util.waiters import wait_for_equal
+
+
+class CuckooTestCase(ValkeyBloomTestCaseBase):
+    @pytest.fixture(autouse=True)
+    def use_random_seed_fixture(self):
+        # Cuckoo has a fixed RNG seed; Bloom's seed setting is irrelevant here.
+        self.use_random_seed = 'no'
 
 
 def rewrite_cuckoo_aof(client, server):
@@ -31,6 +41,7 @@ def rewrite_cuckoo_aof(client, server):
                 assert aof.read(2) == b'\r\n'
             if args[0].upper() == b'CF.LOAD':
                 assert len(args) == 3
+                assert args[1] not in snapshots, f'Duplicate CF.LOAD for {args[1]!r}'
                 snapshots[args[1]] = args[2]
     assert snapshots, 'Rewritten AOF contains no CF.LOAD commands'
     return snapshots

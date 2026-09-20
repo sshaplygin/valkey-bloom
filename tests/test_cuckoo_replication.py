@@ -3,10 +3,22 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.valkey_test_case import ReplicationTestCase
 from cuckoo_test_utils import rewrite_cuckoo_aof
+from valkeytestframework.util.waiters import wait_for_equal
 
 class TestCuckooReplication(ReplicationTestCase):
 
     use_random_seed = 'no'
+
+    def waitForReplicaToSyncUp(self, server):
+        super().waitForReplicaToSyncUp(server)
+        # The framework only waits for the link to be up. The replica may still
+        # be applying commands, especially on ASAN builds; wait for our writes.
+        offset = self.client.info('replication')['master_repl_offset']
+        wait_for_equal(
+            lambda: server.client.info('replication')['slave_repl_offset'] >= offset,
+            True,
+            timeout=10,
+        )
 
     @pytest.fixture(autouse=True)
     def setup_test(self, setup):
@@ -23,11 +35,8 @@ class TestCuckooReplication(ReplicationTestCase):
         )
 
     @pytest.fixture(autouse=True)
-    def use_random_seed_fixture(self, bloom_config_parameterization):
-        if bloom_config_parameterization == "random-seed":
-            self.use_random_seed = "yes"
-        elif bloom_config_parameterization == "fixed-seed":
-            self.use_random_seed = "no"
+    def use_random_seed_fixture(self):
+        self.use_random_seed = 'no'
 
     def test_cf_add_replication(self):
         """Test that CF.ADD replicates to replica"""
@@ -219,13 +228,19 @@ class TestCuckooReplication(ReplicationTestCase):
         self.client.execute_command('CF.RESERVE', 'snapshot', 128, 'BUCKETSIZE', 2, 'EXPANSION', 2)
         for i in range(400):
             self.client.execute_command('CF.ADD', 'snapshot', f'value-{i}')
+        for i in range(20):
+            assert self.client.execute_command('CF.DEL', 'snapshot', f'value-{i}') == 1
         self.setup_replication(num_replicas=1)
         replica = self.replicas[0].client
+        assert replica.execute_command('CF.INFO', 'snapshot', 'Number of items deleted') == 20
         assert self.client.dump('snapshot') == replica.dump('snapshot')
         for i in range(400, 1200):
             self.client.execute_command('CF.ADD', 'snapshot', f'value-{i}')
+        for i in range(20, 40):
+            assert self.client.execute_command('CF.DEL', 'snapshot', f'value-{i}') == 1
         self.waitForReplicaToSyncUp(self.replicas[0])
         assert self.client.dump('snapshot') == replica.dump('snapshot')
+        assert replica.execute_command('CF.INFO', 'snapshot', 'Number of items deleted') == 40
 
     def test_nx_skipped_items_are_not_replayed_as_adds(self):
         self.setup_replication(num_replicas=1)
@@ -246,7 +261,7 @@ class TestCuckooReplication(ReplicationTestCase):
         assert c.dump('nx') == self.replicas[0].client.dump('nx')
 
     def test_full_sync_ignores_replica_memory_limit(self):
-        self.client.execute_command('CF.RESERVE', 'large', 100000)
+        self.client.execute_command('CF.RESERVE', 'large', 1000000, 'BUCKETSIZE', 5)
         self.client.execute_command('CF.ADD', 'large', 'saved')
         self.args['bf.cuckoo-memory-usage-limit'] = '1024'
         self.setup_replication(num_replicas=1)
@@ -255,6 +270,19 @@ class TestCuckooReplication(ReplicationTestCase):
         self.client.execute_command('CF.ADD', 'large', 'next')
         self.waitForReplicaToSyncUp(self.replicas[0])
         assert replica.dump('large') == self.client.dump('large')
+
+    def test_replicated_restore_ignores_replica_memory_limit(self):
+        self.setup_replication(num_replicas=1)
+        replica = self.replicas[0].client
+        replica.config_set('bf.cuckoo-memory-usage-limit', 1024)
+        self.client.execute_command('CF.RESERVE', 'source', 1000000, 'BUCKETSIZE', 5)
+        self.client.execute_command('CF.ADD', 'source', 'saved')
+        dump = self.client.dump('source')
+        self.client.delete('source')
+        self.client.restore('restored', 0, dump)
+        self.waitForReplicaToSyncUp(self.replicas[0])
+        assert replica.dump('restored') == dump
+        assert replica.execute_command('CF.EXISTS', 'restored', 'saved') == 1
 
     def test_failed_eviction_then_raised_limit_replicates_identically(self):
         self.setup_replication(num_replicas=1)

@@ -1,10 +1,10 @@
-import time
+import pytest
 from valkeytestframework.util.waiters import *
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 from valkeytestframework.conftest import resource_port_tracker
 
-class TestCuckooBasic(ValkeyBloomTestCaseBase):
+class TestCuckooBasic(CuckooTestCase):
 
     def test_basic(self):
         client = self.server.get_new_client()
@@ -180,32 +180,29 @@ class TestCuckooBasic(ValkeyBloomTestCaseBase):
         assert client.execute_command('CF.RESERVE filter 10 EXPANSION 2') == b'OK'
 
         # Add items up to capacity
-        for i in range(15):
+        for i in range(17):
             result = client.execute_command(f'CF.ADD filter item{i}')
             # Should succeed even past initial capacity due to scaling
-            assert result == 1 or result == 0  # 0 if false positive
+            assert result == 1
 
         # Check that filter scaled
         info_result = client.execute_command('CF.INFO filter')
-        # Should have multiple filters now
-        # Note: Exact assertion depends on INFO output format
+        assert dict(zip(info_result[::2], info_result[1::2]))[b'Number of filters'] > 1
 
     def test_non_scaling_filter_full(self):
         client = self.server.get_new_client()
-        # Create a non-scaling filter (expansion = 0)
-        assert client.execute_command('CF.RESERVE filter 5') == b'OK'
-
-        # Try to fill it completely
-        added_count = 0
-        for i in range(20):
-            try:
-                result = client.execute_command(f'CF.ADD filter item{i}')
-                if result == 1:
-                    added_count += 1
-            except ResponseError as e:
-                # Should eventually get "filter is full" error
-                assert "full" in str(e).lower()
-                break
-
-        # Should have added some items before it became full
-        assert added_count > 0
+        client.execute_command('CF.RESERVE', 'filter', 1, 'BUCKETSIZE', 4, 'EXPANSION', 0)
+        assert client.execute_command('CF.INFO', 'filter', 'Number of buckets') == 1
+        for count in range(1, 5):
+            assert client.execute_command('CF.ADD', 'filter', 'duplicate') == 1
+            assert client.execute_command('CF.COUNT', 'filter', 'duplicate') == count
+        before = client.execute_command('DEBUG', 'DIGEST-VALUE', 'filter')
+        dump = client.dump('filter')
+        with pytest.raises(ResponseError, match='^non scaling cuckoo filter is full$'):
+            client.execute_command('CF.ADD', 'filter', 'duplicate')
+        assert client.execute_command('DEBUG', 'DIGEST-VALUE', 'filter') == before
+        assert client.dump('filter') == dump
+        assert client.execute_command('CF.INFO', 'filter', 'Number of filters') == 1
+        assert client.execute_command('CF.DEL', 'filter', 'duplicate') == 1
+        assert client.execute_command('CF.ADD', 'filter', 'duplicate') == 1
+        assert client.execute_command('CF.COUNT', 'filter', 'duplicate') == 4

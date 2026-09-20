@@ -1,8 +1,8 @@
 import pytest
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 
-class TestCuckooCommand(ValkeyBloomTestCaseBase):
+class TestCuckooCommand(CuckooTestCase):
 
     def test_cf_add_command(self):
         """Test CF.ADD command"""
@@ -14,7 +14,7 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
 
         # Add duplicate (cuckoo filters can handle duplicates)
         result = client.execute_command('CF.ADD myfilter item1')
-        assert result in [0, 1]  # May return 0 if already exists
+        assert result == 1
 
         # Wrong number of arguments
         with pytest.raises(ResponseError):
@@ -50,11 +50,8 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         assert client.execute_command('CF.DEL myfilter item2') == 0
 
         # Delete from non-existent filter
-        try:
+        with pytest.raises(ResponseError, match='^not found$'):
             client.execute_command('CF.DEL nonexistent item1')
-            assert False, "Should have raised error"
-        except ResponseError:
-            pass
 
         # Wrong number of arguments
         with pytest.raises(ResponseError):
@@ -160,7 +157,7 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         # Insert with auto-create
         result = client.execute_command('CF.INSERT myfilter ITEMS item1 item2 item3')
         assert len(result) == 3
-        assert all(x in [0, 1] for x in result)
+        assert result == [1, 1, 1]
 
         # Insert with NOCREATE on non-existent filter
         with pytest.raises(ResponseError):
@@ -212,13 +209,9 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         assert client.execute_command('CF.ADD myfilter item1') == 1
         assert client.execute_command('CF.ADD myfilter item2') == 1
 
-        # Get specific field (if supported)
-        try:
-            size = client.execute_command('CF.INFO myfilter Size')
-            assert size is not None
-        except ResponseError:
-            # Specific field queries might not be supported
-            pass
+        assert client.execute_command('CF.INFO', 'myfilter', 'Size') > 0
+        with pytest.raises(ResponseError, match='^unknown option$'):
+            client.execute_command('CF.INFO', 'myfilter', 'unknown-field')
 
         # Wrong number of arguments
         with pytest.raises(ResponseError):
@@ -281,3 +274,60 @@ class TestCuckooCommand(ValkeyBloomTestCaseBase):
         fields = dict(zip(info[::2], info[1::2]))
         assert fields[b'Number of buckets'] == 256
         assert client.execute_command('CF.INFO', 'buckets', 'NUMBER OF BUCKETS') == fields[b'Number of buckets']
+
+    def test_command_metadata_matches_json_and_key_positions(self):
+        import json
+        from pathlib import Path
+
+        client = self.server.get_new_client()
+        paths = sorted((Path(__file__).resolve().parents[1] / 'src' / 'commands').glob('cf.*.json'))
+        assert len(paths) == 11
+        for path in paths:
+            command, spec = next(iter(json.loads(path.read_text()).items()))
+            info = client.execute_command('COMMAND', 'INFO', command)[command]
+            assert info['arity'] == spec['arity'], command
+            assert set(info['flags']) - {'module'} == set(spec['command_flags']), command
+            assert (info['first_key_pos'], info['last_key_pos'], info['step_count']) == (1, 1, 1)
+            for category in spec['acl_categories']:
+                names = client.execute_command('ACL', 'CAT', category.lower())
+                assert command.lower().encode() in [name.lower() for name in names]
+            # Exercise server-side arity rejection before any handler can mutate a key.
+            with pytest.raises(ResponseError, match='wrong number of arguments'):
+                client.execute_command(command, *(['key'] * (abs(spec['arity']) - 2)))
+        assert client.dbsize() == 0
+
+    def test_shared_validation_preserves_messages_for_existing_keys(self):
+        client = self.server.get_new_client()
+        client.execute_command('CF.RESERVE', 'existing', 64)
+        client.set('wrongtype', 'value')
+        before = client.dump('existing')
+        cases = [
+            ('CAPACITY', 0, 'capacity must be larger than 0'),
+            ('CAPACITY', -1, 'capacity must be between min and max'),
+            ('CAPACITY', 2**32 + 1, 'capacity must be between min and max'),
+            ('BUCKETSIZE', -1, 'bucket size must be between min and max'),
+            ('BUCKETSIZE', 0, 'bucket size must be between min and max'),
+            ('BUCKETSIZE', 256, 'bucket size must be between min and max'),
+            ('BUCKETSIZE', 2**32 + 1, 'bucket size must be between min and max'),
+            ('MAXITERATIONS', -1, 'max kicks must be between min and max'),
+            ('MAXITERATIONS', 0, 'max kicks must be between min and max'),
+            ('MAXITERATIONS', 65536, 'max kicks must be between min and max'),
+            ('MAXITERATIONS', 2**32 + 1, 'max kicks must be between min and max'),
+        ]
+        for key in ['absent', 'existing', 'wrongtype']:
+            for option, value, message in cases:
+                commands = [
+                    ('CF.INSERT', key, option, value, 'ITEMS', 'item'),
+                    ('CF.INSERTNX', key, option, value, 'ITEMS', 'item'),
+                    ('CF.RESERVE', key, value) if option == 'CAPACITY'
+                    else ('CF.RESERVE', key, 64, option, value),
+                ]
+                for command in commands:
+                    with pytest.raises(ResponseError) as error:
+                        client.execute_command(*command)
+                    assert str(error.value) == message, command
+        assert not client.exists('absent')
+        assert client.dump('existing') == before
+        assert client.get('wrongtype') == b'value'
+        assert client.execute_command('CF.RESERVE', 'boundaries', 1, 'BUCKETSIZE', 255,
+                                      'MAXITERATIONS', 65535) == b'OK'

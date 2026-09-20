@@ -1,4 +1,4 @@
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 
 
 METRICS = (
@@ -18,7 +18,7 @@ def filter_info(client, key):
     return dict(zip(reply[::2], reply[1::2]))
 
 
-class TestCuckooMetrics(ValkeyBloomTestCaseBase):
+class TestCuckooMetrics(CuckooTestCase):
 
     def test_initial_metrics(self):
         assert metrics(self.server.get_new_client()) == dict.fromkeys(METRICS, 0)

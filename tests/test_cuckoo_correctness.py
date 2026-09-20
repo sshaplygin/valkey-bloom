@@ -1,9 +1,10 @@
 import random
+import pytest
 import string
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 
-class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
+class TestCuckooCorrectness(CuckooTestCase):
 
     def test_add_and_check_correctness(self):
         """Test that items added are correctly detected"""
@@ -73,7 +74,7 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         for item in test_items:
             result = client.execute_command(f'CF.ADD myfilter {item}')
             # Should successfully add
-            assert result in [0, 1]
+            assert result == 1
 
         # Verify no false negatives - all added items should exist
         false_negatives = 0
@@ -129,8 +130,8 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         result = client.execute_command('CF.INSERT myfilter ITEMS', *items)
 
         assert len(result) == 20
-        # All items should be added (return 1) or already exist (return 0)
-        assert all(x in [0, 1] for x in result)
+        # Every ordinary insertion stores a fingerprint, including duplicates.
+        assert result == [1] * len(items)
 
         # Verify all items exist
         for item in items:
@@ -199,27 +200,26 @@ class TestCuckooCorrectness(ValkeyBloomTestCaseBase):
         """Test behavior when approaching capacity"""
         client = self.server.get_new_client()
 
-        # Create small non-scaling filter
-        capacity = 50
-        assert client.execute_command(f'CF.RESERVE myfilter {capacity}') == b'OK'
-
-        # Try to add items up to and beyond capacity
-        added_count = 0
-        failed = False
-        for i in range(capacity * 2):
+        client.execute_command('CF.RESERVE', 'myfilter', 50, 'EXPANSION', 0)
+        slots = client.execute_command('CF.INFO', 'myfilter', 'Number of buckets') * 4
+        inserted = []
+        for i in range(slots + 1):
+            before = client.execute_command('DEBUG', 'DIGEST-VALUE', 'myfilter')
+            dump = client.dump('myfilter')
             try:
-                result = client.execute_command(f'CF.ADD myfilter item_{i}')
-                if result == 1:
-                    added_count += 1
-            except ResponseError as e:
-                if 'full' in str(e).lower():
-                    failed = True
-                    break
-
-        # Should have added some items
-        assert added_count > 0
-        # Non-scaling filter should eventually fail
-        # Note: Exact behavior depends on implementation
+                assert client.execute_command('CF.ADD', 'myfilter', f'item_{i}') == 1
+                inserted.append(f'item_{i}')
+            except ResponseError as error:
+                assert str(error) == 'non scaling cuckoo filter is full'
+                assert client.execute_command('DEBUG', 'DIGEST-VALUE', 'myfilter') == before
+                assert client.dump('myfilter') == dump
+                break
+        else:
+            pytest.fail('Non-scaling filter accepted more fingerprints than slots')
+        assert inserted
+        assert client.execute_command('CF.MEXISTS', 'myfilter', *inserted) == [1] * len(inserted)
+        assert client.execute_command('CF.INFO', 'myfilter', 'Number of filters') == 1
+        assert client.execute_command('CF.INFO', 'myfilter', 'Number of items inserted') == len(inserted)
 
     def test_info_reflects_operations(self):
         """Test that CF.INFO accurately reflects filter state"""

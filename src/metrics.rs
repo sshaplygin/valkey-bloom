@@ -18,6 +18,7 @@ lazy_static! {
     pub static ref CUCKOO_NUM_ITEMS_ACROSS_OBJECTS: AtomicU64 = AtomicU64::new(0);
     pub static ref CUCKOO_CAPACITY_ACROSS_OBJECTS: AtomicU64 = AtomicU64::new(0);
     pub static ref CUCKOO_DEFRAG_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static ref CUCKOO_DEFRAG_BUCKET_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
     pub static ref CUCKOO_DEFRAG_MISSES: AtomicU64 = AtomicU64::new(0);
 }
 
@@ -108,6 +109,12 @@ pub fn cuckoo_info_handler(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "cuckoo_defrag_misses",
             CUCKOO_DEFRAG_MISSES.load(Ordering::Relaxed).to_string(),
+        )?
+        .field(
+            "cuckoo_defrag_bucket_attempts",
+            CUCKOO_DEFRAG_BUCKET_ATTEMPTS
+                .load(Ordering::Relaxed)
+                .to_string(),
         )?
         .build_section()?
         .build_info()?;

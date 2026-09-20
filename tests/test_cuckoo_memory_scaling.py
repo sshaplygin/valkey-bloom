@@ -9,7 +9,7 @@ Run with:
     python3 -m pytest tests/test_cuckoo_memory_scaling.py -v -s
 """
 from valkey import ResponseError
-from valkey_bloom_test_case import ValkeyBloomTestCaseBase
+from cuckoo_test_utils import CuckooTestCase
 
 
 def _cf_info_size(client, key):
@@ -21,7 +21,7 @@ def _cf_info_size(client, key):
     raise ValueError(f"Size not found in CF.INFO output: {info}")
 
 
-class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
+class TestCuckooMemoryScaling(CuckooTestCase):
 
     def test_memory_by_capacity(self):
         """Memory usage vs capacity (bucket_size=4, expansion=1)."""
@@ -30,6 +30,9 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
         bucket_size = 4
         expansion = 1
 
+        client.execute_command('CF.RESERVE', 'overhead', 1, 'BUCKETSIZE', 1)
+        overhead = _cf_info_size(client, 'overhead') - 1
+        client.delete('overhead')
         rows = []
         for cap in capacities:
             client.execute_command("DEL", "cf_bench")
@@ -39,6 +42,7 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
                 "EXPANSION", expansion,
             )
             size = _cf_info_size(client, "cf_bench")
+            _assert_single_filter_size(client, cap, bucket_size, overhead, size)
             rows.append((cap, bucket_size, expansion, size))
 
         _print_table(
@@ -55,6 +59,9 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
         bucket_sizes = [1, 2, 4, 8, 16, 32]
         expansion = 1
 
+        client.execute_command('CF.RESERVE', 'overhead', 1, 'BUCKETSIZE', 1)
+        overhead = _cf_info_size(client, 'overhead') - 1
+        client.delete('overhead')
         rows = []
         for bs in bucket_sizes:
             client.execute_command("DEL", "cf_bench")
@@ -64,6 +71,7 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
                 "EXPANSION", expansion,
             )
             size = _cf_info_size(client, "cf_bench")
+            _assert_single_filter_size(client, capacity, bs, overhead, size)
             rows.append((capacity, bs, expansion, size))
 
         _print_table(
@@ -80,6 +88,9 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
         bucket_size = 4
         expansions = [0, 1, 2, 4]  # 0 = non-scaling
 
+        client.execute_command('CF.RESERVE', 'overhead', 1, 'BUCKETSIZE', 1)
+        overhead = _cf_info_size(client, 'overhead') - 1
+        client.delete('overhead')
         rows = []
         for exp in expansions:
             client.execute_command("DEL", "cf_bench")
@@ -105,6 +116,12 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
             assert info_dict[b"Number of items inserted"] == inserted
             size = info_dict.get(size_key, "N/A")
             num_filters = info_dict.get(filters_key, "N/A")
+            assert size >= overhead + capacity
+            assert num_filters >= 1
+            if exp == 0:
+                assert num_filters == 1
+            else:
+                assert inserted == capacity
             rows.append((capacity, bucket_size, exp, inserted, num_filters, size))
 
         _print_table(
@@ -121,6 +138,9 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
         bucket_sizes = [1, 2, 4, 8]
         expansion = 1
 
+        client.execute_command('CF.RESERVE', 'overhead', 1, 'BUCKETSIZE', 1)
+        overhead = _cf_info_size(client, 'overhead') - 1
+        client.delete('overhead')
         rows = []
         for cap in capacities:
             for bs in bucket_sizes:
@@ -131,6 +151,7 @@ class TestCuckooMemoryScaling(ValkeyBloomTestCaseBase):
                     "EXPANSION", expansion,
                 )
                 size = _cf_info_size(client, "cf_bench")
+                _assert_single_filter_size(client, cap, bs, overhead, size)
                 rows.append((cap, bs, size))
 
         _print_table(
@@ -157,3 +178,11 @@ def _print_table(title, headers, rows):
     for row in str_rows:
         print("| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row)) + " |")
     print()
+
+
+def _assert_single_filter_size(client, capacity, bucket_size, overhead, size):
+    requested_buckets = (capacity + bucket_size - 1) // bucket_size
+    buckets = 1 << (requested_buckets - 1).bit_length()
+    assert client.execute_command('CF.INFO', 'cf_bench', 'Number of buckets') == buckets
+    assert size == overhead + buckets * bucket_size
+    assert client.memory_usage('cf_bench') >= size

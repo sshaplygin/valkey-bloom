@@ -19,7 +19,9 @@ use valkey_module_macros::info_command_handler;
 // Unit tests run outside a server. Keep allocator selection local to this
 // target so building tests cannot enable the system allocator in the module.
 #[cfg(test)]
-use std::alloc::System as ModuleAllocator;
+use test_allocator::TrackingAllocator as ModuleAllocator;
+#[cfg(test)]
+mod test_allocator;
 #[cfg(not(test))]
 use valkey_module::alloc::ValkeyAlloc as ModuleAllocator;
 
@@ -46,7 +48,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         );
         Status::Err
     } else {
-        Status::Ok
+        cuckoo::command_metadata::register_arity(ctx)
     }
 }
 
@@ -105,12 +107,12 @@ fn bloom_load_command(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 /// Command handler for CF.ADD <key> <item>
 fn cuckoo_add_command(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    cuckoo_handler::cuckoo_filter_add_value(ctx, args, false)
+    cuckoo_handler::cuckoo_filter_add_value(ctx, args)
 }
 
 /// Command handler for CF.ADDNX <key> <item>
 fn cuckoo_addnx_command(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    cuckoo_handler::cuckoo_filter_addnx(ctx, args, false)
+    cuckoo_handler::cuckoo_filter_addnx(ctx, args)
 }
 
 /// Command handler for CF.COUNT <key> <item>
